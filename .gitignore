@@ -72,3 +72,6 @@ settings.local.json
 # Generated artifacts and local backups (not source)
 artifacts/
 _backups/
+
+# stray local test images
+ai/camera_brain/sb.jpg

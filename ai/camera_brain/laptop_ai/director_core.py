@@ -127,7 +127,7 @@ from laptop_ai.config import TEMPORAL_SMOOTHING, FRAME_SKIP, TEMP_ARTIFACT_DIR, 
 
 # USER CONFIG: Streaming from Cloud Proxy (Radxa -> Cloud -> Laptop)
 # USER CONFIG: Streaming from Cloud Proxy (Radxa -> Cloud -> Laptop)
-RTSP_URL = "rtsp://100.89.83.125:8554/gopro"  # MediaMTX clean H264 feed (GoPro -> Radxa re-encode)
+RTSP_URL = os.getenv("RTSP_URL", f"rtsp://{os.getenv('CUBIE_TS_IP', '100.64.0.30')}:8554/gopro")  # MediaMTX clean H264 (GoPro -> companion re-encode)
 # Lidar->FC alignment, found by push calibration (calibrate_lidar.py).
 # LIDAR_FRONT_BEARING_DEG = the RAW lidar bearing that points along the FC's forward axis.
 # LIDAR_HANDED: -1 maps the (CCW) lidar into the grid's mirrored (front=-y,right=+x) frame
@@ -844,7 +844,7 @@ class DirectorCore:
         # Path 2 (RENDER): Cloud server MJPEG relay (200ms+, 480p JPEG fallback)
 
         # 1. Tailscale UDP stream from Radxa (primary — fast, works across any network)
-        RADXA_TAILSCALE_IP = os.getenv("CUBIE_TS_IP", "100.89.83.125")
+        RADXA_TAILSCALE_IP = os.getenv("CUBIE_TS_IP", "100.64.0.30")
         internal_src = f"rtsp://{RADXA_TAILSCALE_IP}:8554/gopro"  # MediaMTX clean H264 (low-latency RTSP)
 
         # 2. Cloud relay fallback (if Tailscale is down)

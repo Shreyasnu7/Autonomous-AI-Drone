@@ -6,7 +6,7 @@
 [![Firmware](https://img.shields.io/badge/flight%20stack-ArduPilot%204.6-orange.svg)](https://ardupilot.org)
 [![Pilot Model](https://img.shields.io/badge/pilot-Qwen2.5--VL--7B--AWQ-brightgreen.svg)](https://huggingface.co/Qwen)
 [![Validation](https://img.shields.io/badge/SITL-13%2F13%20passing-success.svg)](docs/VERIFICATION.md)
-[![Status](https://img.shields.io/badge/status-pre--flight%20validation-yellow.svg)](#project-status)
+[![Status](https://img.shields.io/badge/status-flight%20testing-orange.svg)](#project-status)
 
 ---
 
@@ -199,7 +199,12 @@ Full methodology: [docs/VERIFICATION.md](docs/VERIFICATION.md).
 
 ## Project status
 
-**Pre-flight validation.** Honest maturity assessment:
+**Under flight test. Autonomy integration in progress.**
+
+The aircraft is flying. The autonomous stack is being brought online against it
+incrementally — each competence is validated on the bench, then in a controlled
+flight envelope with a pilot on the sticks, before it is trusted to command the
+aircraft unsupervised.
 
 | Area | Status |
 |---|---|
@@ -207,10 +212,23 @@ Full methodology: [docs/VERIFICATION.md](docs/VERIFICATION.md).
 | Bridge ↔ firmware command paths | ✅ Verified against real ArduPilot (SITL) |
 | Sensor fusion and spatial grid | ✅ Complete; LiDAR→FC ingestion confirmed on hardware |
 | Ground app (telemetry, video, missions) | ✅ Functional |
-| Hardware integration | 🟡 Partially validated on the aircraft |
-| **Flight testing** | 🔴 **Not yet performed** |
+| Hardware integration | 🟡 On the aircraft; power-integrity rebuild in progress |
+| **Piloted flight testing** | 🟡 **Underway** |
+| **Autonomous mission execution** | 🟡 **In progress — not yet cleared for unsupervised flight** |
 
-Nothing in this repository has been validated in powered flight. Simulation and firmware-in-the-loop results are not a substitute for flight testing. See [SAFETY.md](SAFETY.md).
+### What "in progress" means here
+
+Flight testing follows the staged programme in [SAFETY.md](SAFETY.md): airframe and
+link integrity first, then AI-commanded motion within a bounded envelope under
+pilot supervision, and only then longer autonomous sequences. Authority is handed
+to the autonomy stack one layer at a time, and a human retains override throughout —
+RC override expiry, geofence, and the safety envelope are active in every stage.
+
+Accordingly: the architecture and command paths are verified, the aircraft flies, and
+autonomous behaviours are being validated on it now. **Full unsupervised autonomous
+mission execution is not yet demonstrated in flight**, and simulation and
+firmware-in-the-loop results remain no substitute for flight data. Results will be
+recorded in [docs/VERIFICATION.md](docs/VERIFICATION.md) as each stage is cleared.
 
 ---
 
@@ -243,7 +261,7 @@ Bill of materials, wiring, and **hard-won power-integrity requirements**: [docs/
 
 ### 1 — Ground station
 ```bash
-git clone https://github.com/Shreyasnu7/Drone_Server.git && cd Drone_Server
+git clone https://github.com/Shreyasnu7/autonomous-ai-drone.git && cd autonomous-ai-drone
 pip install -r requirements.txt
 export GEMINI_API_KEY="your-key-here"
 ```
@@ -319,7 +337,9 @@ tests/                          SITL and integration harnesses
 ## Roadmap
 
 ### Near term — validate and harden autonomy
-- [ ] First powered flight validation (indoor GPS-denied, then outdoor GPS)
+- [x] Powered flight testing begun (piloted, bounded envelope)
+- [ ] Staged hand-off of flight authority to the autonomy stack (see [SAFETY.md](SAFETY.md))
+- [ ] Full autonomous mission execution, indoor GPS-denied then outdoor GPS
 - [ ] Bench-verify BendyRuler path deviation with the live proximity ring
 - [ ] Optical-flow module for robust indoor position hold
 - [ ] Promote the local A* costmap planner from opt-in to default after simulation validation

@@ -6,7 +6,7 @@ fly on RC. Run this BEFORE takeoff, leave it running in a terminal on your desk.
 Usage: python watch_fc_messages.py [radxa_tailscale_ip]
 Default IP is the one in laptop_ai/config.py (CUBIE_TAILSCALE_IP).
 """
-import asyncio, json, subprocess, sys, time
+import asyncio, json, os, subprocess, sys, time
 
 try:
     import winsound
@@ -16,7 +16,7 @@ except ImportError:
 
 import websockets
 
-DEFAULT_IP = "100.89.83.125"  # Radxa Cubie A7Z Tailscale IP (update if it changes)
+DEFAULT_IP = os.getenv("CUBIE_TS_IP", "100.64.0.30")  # placeholder; set CUBIE_TS_IP to your tailnet address
 
 def toast(title, message):
     """Native Windows 10/11 toast notification via PowerShell (no extra pip package needed)."""

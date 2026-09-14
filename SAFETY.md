@@ -8,9 +8,11 @@ This software commands a multirotor aircraft with exposed rotating propellers, c
 
 ## 1. Maturity statement
 
-**No component of this system has been validated in powered flight.**
+**Flight testing is underway. The autonomous stack is not yet cleared for unsupervised flight.**
 
-Verification to date consists of simulation and software-in-the-loop testing against real flight-control firmware. That reduces risk substantially — several failures that would have occurred in the field were caught and corrected — but it does not establish airworthiness.
+The aircraft is flying under pilot control, and autonomous behaviours are being validated against it one stage at a time (§6). Verification prior to flight consisted of simulation and software-in-the-loop testing against real flight-control firmware. That reduced risk substantially — several failures that would have occurred in the field were caught and corrected — but it does not establish airworthiness.
+
+**Treat any behaviour whose flight-test stage has not been recorded as cleared as unproven, and fly it as a first-time behaviour.** The table below reflects what bench and simulation work establishes; flight data supersedes it only for stages actually flown.
 
 | Verified | Not verified |
 |---|---|

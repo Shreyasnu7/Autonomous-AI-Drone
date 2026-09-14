@@ -4,9 +4,10 @@ import subprocess
 
 # ===== CONNECTION MODE =====
 # Priority: TAILSCALE (fastest) → RENDER (fallback)
-# Tailscale IPs (from tailscale admin)
-CUBIE_TAILSCALE_IP = os.getenv("CUBIE_TS_IP", "100.89.83.125")
-LAPTOP_TAILSCALE_IP = os.getenv("LAPTOP_TS_IP", "100.84.75.22")
+# Tailscale IPs. The defaults below are PLACEHOLDERS -- set CUBIE_TS_IP and
+# LAPTOP_TS_IP to your own tailnet addresses (`tailscale ip -4`) before use.
+CUBIE_TAILSCALE_IP = os.getenv("CUBIE_TS_IP", "100.64.0.30")
+LAPTOP_TAILSCALE_IP = os.getenv("LAPTOP_TS_IP", "100.64.0.10")
 
 # Auto-detect: is Tailscale running and can we reach the Cubie?
 # Use a real TCP connection (ICMP ping is often blocked over Tailscale/networks).

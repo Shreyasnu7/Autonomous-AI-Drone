@@ -383,8 +383,8 @@ ExecStart=$USER_HOME/launch_bridge.sh
 WorkingDirectory=$USER_HOME
 Restart=always
 RestartSec=5
-Environment=TS_LAPTOP_IP=100.84.75.22
-Environment=TS_PHONE_IP=100.109.112.110
+Environment=TS_LAPTOP_IP=100.64.0.10
+Environment=TS_PHONE_IP=100.64.0.20
 
 [Install]
 WantedBy=multi-user.target
@@ -517,8 +517,8 @@ echo " ⚠️  NEVER PULL POWER WITHOUT SHUTDOWN!"
 echo "   Type 'off' or 'sudo poweroff' before disconnecting battery"
 echo ""
 echo " Tailscale IPs:"
-echo "   Laptop: 100.84.75.22"
-echo "   Phone:  100.109.112.110"
+echo "   Laptop: 100.64.0.10"
+echo "   Phone:  100.64.0.20"
 echo ""
 echo " Server:"
 echo "   wss://drone-server-r0qe.onrender.com/ws/connect/RADXA_X"

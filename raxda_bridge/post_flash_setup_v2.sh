@@ -177,7 +177,7 @@ systemctl enable --now tailscaled
 echo "  Tailscale daemon enabled"
 echo ""
 echo "  >>> IMPORTANT: Run 'sudo tailscale up' after setup to authenticate <<<"
-echo "  >>> Then verify: tailscale ip -4 (should show 100.94.63.59) <<<"
+echo "  >>> Then verify: tailscale ip -4 (should show 100.64.0.30) <<<"
 echo ""
 
 # ===== 9. THERMAL WATCHDOG =====
@@ -342,7 +342,7 @@ echo "   2. sudo reboot          (apply overlays)"
 echo "   3. After reboot, bridge auto-starts"
 echo ""
 echo " TO DEPLOY CODE REMOTELY (from laptop):"
-echo "   ssh shreyash@100.94.63.59"
+echo "   ssh shreyash@100.64.0.30"
 echo "   sudo mount -o remount,rw /mnt/sdcard"
 echo "   scp files... /mnt/sdcard/drone_project/..."
 echo "   sudo mount -o remount,ro /mnt/sdcard"

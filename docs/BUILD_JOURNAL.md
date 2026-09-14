@@ -385,8 +385,9 @@ A sixth board was commissioned by transferring the SD card, which restored the c
 | Bridge ↔ firmware command paths | ✅ Verified against real ArduPilot firmware |
 | Sensor fusion, LiDAR → FC ingestion | ✅ Confirmed on hardware |
 | Ground application | ✅ Functional |
-| Hardware integration | 🟡 Partial — awaiting power-system rebuild |
-| Powered flight | 🔴 Not yet performed |
+| Hardware integration | 🟡 Partial — power-system rebuild in progress |
+| Piloted flight testing | 🟡 Underway |
+| Autonomous mission execution in flight | 🟡 In progress — not yet cleared for unsupervised flight |
 
 ---
 

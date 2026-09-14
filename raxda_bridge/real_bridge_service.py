@@ -23,9 +23,10 @@ except ImportError:
 # Cloud server (Render) — used when Tailscale direct connection not available
 SERVER_URL = os.environ.get("SERVER_URL", "wss://drone-server-r0qe.onrender.com/ws/connect/RADXA_X")
 API_URL = os.environ.get("API_URL", "https://drone-server-r0qe.onrender.com")
-# Tailscale IPs for direct streaming (faster than cloud relay)
-TAILSCALE_LAPTOP_IP = os.environ.get("TS_LAPTOP_IP", "100.84.75.22")
-TAILSCALE_PHONE_IP = os.environ.get("TS_PHONE_IP", "100.109.112.110")
+# Tailscale IPs for direct streaming (faster than cloud relay).
+# Defaults are PLACEHOLDERS -- override via TS_LAPTOP_IP / TS_PHONE_IP.
+TAILSCALE_LAPTOP_IP = os.environ.get("TS_LAPTOP_IP", "100.64.0.10")
+TAILSCALE_PHONE_IP = os.environ.get("TS_PHONE_IP", "100.64.0.20")
 # Auto-detect FC UART port based on board
 # Cubie A7Z (Allwinner A733): /dev/ttyAS0 (Pin 8/10)
 # Radxa Zero 3W (RK3566): /dev/ttyS2 (Pin 8/10)
@@ -49,10 +50,10 @@ CAM_HEIGHT = 720
 
 # --- TAILSCALE CONFIG ---
 # Stable 100.x.x.x IPs via Tailscale mesh VPN (works across any network/4G/WiFi)
-TAILSCALE_LAPTOP_IP = os.environ.get("TS_LAPTOP_IP", "100.84.75.22")
-TAILSCALE_PHONE_IP = os.environ.get("TS_PHONE_IP", "100.109.112.110")  # shreyashs-s21-ultra
+TAILSCALE_LAPTOP_IP = os.environ.get("TS_LAPTOP_IP", "100.64.0.10")
+TAILSCALE_PHONE_IP = os.environ.get("TS_PHONE_IP", "100.64.0.20")  # ground-station-phone
 TAILSCALE_VIDEO_PORT = 8554   # UDP video stream port
-TAILSCALE_RADXA_IP = "100.94.242.14"  # This device (New Radxa, SD card boot)
+TAILSCALE_RADXA_IP = os.environ.get("TS_SELF_IP", "100.64.0.30")  # this device; placeholder default
 class SafetyEnvelope:
     """
     Real-time safety gate using ALL available sensors:

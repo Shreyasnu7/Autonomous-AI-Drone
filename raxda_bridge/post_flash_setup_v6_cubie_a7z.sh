@@ -359,9 +359,9 @@ echo "  ✅ Bluetooth ready (pair GoPro via: bluetoothctl pair E1:9D:9A:BB:E5:5B
 echo "[16] Environment config..."
 cat > $USER_HOME/.drone_env << 'EOF'
 # Drone environment variables
-export CUBIE_TS_IP="100.75.168.51"
-export LAPTOP_TS_IP="100.84.75.22"
-export PHONE_TS_IP="100.109.112.110"
+export CUBIE_TS_IP="100.64.0.30"
+export LAPTOP_TS_IP="100.64.0.10"
+export PHONE_TS_IP="100.64.0.20"
 export GOPRO_MAC="E1:9D:9A:BB:E5:5B"
 export FC_PORT="/dev/ttyAS0"
 export FC_BAUD="57600"
