@@ -22,6 +22,8 @@ The drone decides **where to go, what to examine, how to get there, and when the
 
 Most LLM-controlled robotics either (a) ask the model for raw numeric velocities, which fails badly, or (b) restrict the model to picking from a menu of hardcoded behaviours, which is not autonomy. This project does neither. It uses a **hybrid intent architecture** in which the model supplies *semantics* and code supplies *geometry* — measured to raise navigation correctness from 5% to 100% while simultaneously halving latency. See [The core contribution](#the-core-contribution-hybrid-intent).
 
+That boundary has a second benefit: because the model's entire output is a small categorical object, the reasoning model is replaceable without touching flight code — so the system's intelligence scales with whatever compute it is given. See [Intelligence is not fixed by the airframe](#intelligence-is-not-fixed-by-the-airframe).
+
 ---
 
 ## What "complex tasks" means here
@@ -151,6 +153,35 @@ flowchart TB
 | **ArduPilot (FC)** | Stabilisation, wind rejection, position hold, avoidance braking | Purpose-built, flight-proven, runs without the AI |
 
 A deliberate principle throughout: **the AI never does what the flight controller does better.** The AI chooses intent and flight *mode*; ArduPilot handles stabilisation, wind rejection and low-level avoidance. If the AI stops, the aircraft remains controllable.
+
+---
+
+## Intelligence is not fixed by the airframe
+
+The reasoning is **not baked into the aircraft.** The airframe carries sensors, a bridge and a flight controller; cognition runs on whatever machine sits at the other end of the link. That separation is the point, and it has a concrete consequence:
+
+> **The drone becomes smarter by upgrading the machine that thinks for it — not by rebuilding the drone.**
+
+This works because the pilot model's entire contract with the rest of the system is a small categorical intent object (see [Hybrid Intent](#the-core-contribution-hybrid-intent)). It emits a direction word, a pace, a yaw behaviour. It never emits geometry, never touches MAVLink, and never makes a safety decision. **Any model capable of producing that object can fly this aircraft.** Substituting one is a configuration change, not a rewrite — flight code, safety layers and firmware are untouched.
+
+This is not a hypothetical property. The pilot has already been swapped across model families and quantisations during development, and the strategic brain is a separate, independently replaceable model.
+
+| Compute tier | What changes | What does **not** change |
+|---|---|---|
+| Larger or newer pilot model | Better scene understanding, more reliable intent in cluttered and ambiguous scenes | Intent schema, resolver, safety envelope, firmware |
+| Faster GPU | Higher control-loop rate, so faster reaction and higher safe speed caps | Control logic, MAVLink interface |
+| More VRAM | Longer visual context, more frames per decision, richer memory of the scene | Bridge, flight modes |
+| Onboard inference (Jetson-class) | Removes the ground-link dependency entirely | Everything above the link |
+
+So the ceiling on this system's intelligence is set by the hardware you point at it and by the state of the art in vision-language models — **and both of those keep improving without any work on the aircraft.** Capability gained this way is inherited, not re-engineered: a model released next year raises the drone's competence the day it is swapped in.
+
+### Two limits that do not move
+
+Honesty matters more than the pitch here, so two constraints are worth stating plainly.
+
+**Safety does not scale with the model, by design.** A more capable pilot model earns no additional authority. Clearance caps, direction correction, envelope clamping and return policy remain in deterministic code, and the model's choice remains a *preference that code may override*. A smarter model makes better proposals; it does not get to bypass the layers that veto them.
+
+**Latency is a real budget, not a free variable.** The loop closes at 236 ms median. A substantially larger model that cannot hold the pilot stage near ~209 ms buys reasoning quality at the cost of reaction time — which, on an aircraft, is a genuine trade rather than a straight upgrade. Faster hardware is what converts a bigger model into an actual gain.
 
 ---
 

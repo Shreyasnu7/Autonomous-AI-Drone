@@ -218,6 +218,32 @@ Five independent layers, ordered from model to motors. Each is active in normal 
 
 Network failure cannot stall the control loop, because no cloud call sits inside it.
 
+### 7.1 Compute independence
+
+Neither brain is coupled to the airframe. The aircraft carries sensors, the bridge and the flight
+controller; both models run off-board, and the pilot model's only contract with the system is the
+categorical intent object of §3.2.
+
+The consequence is that **cognitive capability is a function of the compute attached to the system,
+not of the aircraft**. Replacing the pilot model — a larger model, a newer family, a different
+quantisation — is a configuration change. The resolver, the safety layers, the bridge and the
+firmware are unaffected, because none of them consume anything from the model except a direction
+word, a pace, a yaw behaviour and an optional target. This has been exercised repeatedly: the pilot
+stage has been swapped across model families and quantisations without modification below the
+resolver boundary.
+
+Two properties deliberately do **not** scale with model capability:
+
+- **Authority.** Per §1.4, safety-critical decisions are executed in deterministic code. A more
+  capable model produces better *proposals*; it acquires no additional authority, and the override
+  path is identical regardless of which model is in place.
+- **Latency budget.** §8 records a 236 ms median loop. A larger model that exceeds the pilot stage's
+  budget trades reaction time for reasoning quality. On an aircraft that is a genuine trade-off, and
+  it is resolved by faster compute rather than by relaxing the budget.
+
+The migration path in §9 (onboard Jetson-class inference) removes the ground-link dependency without
+altering anything above the link, for the same reason.
+
 ---
 
 ## 8. Performance
@@ -239,7 +265,7 @@ Perception runs on a background thread, so loop time is `max(perception, inferen
 
 | Limitation | Impact | Mitigation path |
 |---|---|---|
-| No powered-flight validation | All results are simulation or firmware-in-the-loop | Staged flight-test programme |
+| Autonomy not yet validated in powered flight | Aircraft is under flight test; autonomous results to date are simulation or firmware-in-the-loop | Staged flight-test programme |
 | Planar LiDAR | Blind to canopy and sub-plane obstacles | Angled ToF pair; camera depth cone; panoramic camera planned |
 | Ground-station dependency | Control loop requires the link | Onboard inference (Jetson-class) planned |
 | Metric depth tuned indoors | Degraded accuracy outdoors | Triangulation anchoring reduces sensitivity |
