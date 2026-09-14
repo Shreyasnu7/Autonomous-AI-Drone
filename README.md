@@ -325,6 +325,16 @@ required start-up order are documented in **[docs/DEPLOYMENT.md](docs/DEPLOYMENT
 cd ai/camera_brain && python -m laptop_ai.director_core
 ```
 
+### 6 — Ground application (optional)
+
+```bash
+cd app && flutter pub get && flutter build apk --release
+```
+
+Requires the Flutter SDK. The application connects to the companion computer over WebSocket; set the
+address in its settings panel. Released binaries are not committed to this repository — build from
+source, or attach a signed build to a GitHub Release.
+
 ### Validate without hardware
 ```bash
 python tests/sitl_bridge_test.py          # 13 checks vs. real ArduPilot SITL
@@ -350,6 +360,12 @@ raxda_bridge/                   Companion computer
   └─ lidar_pose.py              2D LiDAR SLAM → VISION_POSITION_ESTIMATE
 
 esp32/esp32_firmware/           Sensor hub firmware (ToF, IMU, LED, gimbal)
+
+app/                            Flutter ground application (Android)
+  ├─ lib/screens/               Control, connect, hangar, gallery, auth
+  ├─ lib/services/              Telemetry (WebSocket), media, flight recorder, state
+  └─ lib/widgets/               Artificial horizon, video feed, analytics, settings
+
 docs/                           Architecture, hardware, verification, deployment, build journal
 tests/                          SITL and integration harnesses
 ```

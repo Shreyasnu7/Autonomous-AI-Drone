@@ -1,0 +1,37 @@
+name: drone_app
+description: "A new Flutter project."
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.2.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.6
+  google_fonts: ^6.1.0
+  provider: ^6.1.1
+  shared_preferences: ^2.2.2
+  glassmorphism: ^3.0.0
+  animate_do: ^3.3.4
+  http: ^1.1.0
+  web_socket_channel: ^3.0.3
+  google_maps_flutter: ^2.10.1
+  path_provider: ^2.1.5
+  image_picker: ^1.0.4
+  geolocator: ^13.0.1
+  url_launcher: ^6.2.1
+  gal: ^2.3.0
+  permission_handler: ^11.0.0
+  dio: ^5.4.0
+  webview_flutter: ^4.7.0
+  webview_flutter_android: ^3.16.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true

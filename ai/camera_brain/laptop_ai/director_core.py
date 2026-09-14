@@ -81,7 +81,7 @@ from laptop_ai.mavllink_executor import MavlinkExecutor
 from laptop_ai.render_master import RenderMaster
 from laptop_ai.shot_metadata import ShotMetadata
 from laptop_ai.ai_shot_planner import ShotPlanner
-from laptop_ai.safety_envlope import SafetyEnvelope
+from laptop_ai.safety_envelope import SafetyEnvelope
 from laptop_ai.video_recorder import AsyncVideoWriter
 from laptop_ai.camera_director import CameraDirector
 # WIRED: ADVANCED AI MODELS (DeepStream, Pi0, Gemini)

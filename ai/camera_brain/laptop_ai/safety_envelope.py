@@ -74,3 +74,17 @@ class SafetyEnvelope:
             return False
 
         return True
+
+    def is_critical(self, environment_state):
+        """
+        Reflexive check: is there an obstacle IMMEDIATELY in front (< 1.5m)?
+        Returns True if emergency stop is needed.
+        """
+        if not environment_state or "obstacles" not in environment_state:
+            return False
+
+        for obs in environment_state["obstacles"]:
+            dist = obs.get("distance", 99.0)
+            if dist < 1.5:  # Critical distance
+                return True
+        return False

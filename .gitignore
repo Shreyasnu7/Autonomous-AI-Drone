@@ -5,17 +5,17 @@ __pycache__/
 *.so
 .Python
 build/
-develop-eggs/
-dist/
-downloads/
-eggs/
+/develop-eggs/
+/dist/
+/downloads/
+/eggs/
 .eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
+/lib/
+/lib64/
+/parts/
+/sdist/
+/var/
+/wheels/
 *.egg-info/
 .installed.cfg
 *.egg
@@ -75,3 +75,18 @@ _backups/
 
 # stray local test images
 ai/camera_brain/sb.jpg
+
+# Flutter / Android build artifacts (ground app)
+app/build/
+app/.dart_tool/
+app/.gradle/
+app/android/.gradle/
+app/android/app/build/
+app/android/local.properties
+app/ios/Pods/
+app/**/*.iml
+*.apk
+*.aab
+*.jks
+*.keystore
+key.properties

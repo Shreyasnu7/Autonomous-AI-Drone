@@ -22,7 +22,7 @@ modules_to_test = [
     "laptop_ai.render_master",
     "laptop_ai.shot_metadata",
     "laptop_ai.ai_shot_planner",
-    "laptop_ai.safety_envlope",
+    "laptop_ai.safety_envelope",
     "laptop_ai.video_recorder",
     "laptop_ai.camera_director",
     "laptop_ai.deepstream_handler",
