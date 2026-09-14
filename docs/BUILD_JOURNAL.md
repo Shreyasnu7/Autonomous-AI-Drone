@@ -1,6 +1,6 @@
 # Build Journal
 
-A chronological engineering record of the Autonomous Cinematic Drone: what was built, in what order, what failed, why it failed, and how each failure was resolved.
+A chronological engineering record of the Autonomous AI Drone: what was built, in what order, what failed, why it failed, and how each failure was resolved.
 
 This document deliberately records failures alongside successes. Several of the most important architectural decisions in this system exist *because* something broke first, and the root-cause analyses are more instructive than the final code.
 
@@ -13,7 +13,7 @@ This document deliberately records failures alongside successes. Several of the 
 
 ## Phase 0 — Architecture definition
 
-**Objective.** Establish a control architecture capable of natural-language cinematographic missions without scripted flight paths.
+**Objective.** Establish a control architecture capable of executing natural-language mission objectives without scripted flight paths.
 
 **Work.** Three candidate architectures were evaluated:
 
@@ -23,7 +23,7 @@ This document deliberately records failures alongside successes. Several of the 
 | Single local model doing strategy and control | Rejected — models small enough to run locally at 4 Hz lack the reasoning depth for creative direction. |
 | **Two-brain split** | **Selected** — cloud model reasons about intent once per objective; local model handles continuous control. |
 
-A governing constraint was adopted early and never relaxed: **no cinematic maneuver may be hardcoded.** Orbits, follows and approaches must emerge from model intent, otherwise the system is a macro player rather than an autonomous agent.
+A governing constraint was adopted early and never relaxed: **no maneuver may be hardcoded.** Orbits, follows and approaches must emerge from model intent, otherwise the system is a macro player rather than an autonomous agent.
 
 A second constraint followed from flight-safety reasoning: **the AI must not duplicate the flight controller's responsibilities.** Stabilisation, wind rejection and position hold are solved problems in ArduPilot and are handled there. The AI selects intent and flight *mode*; the FC executes.
 
@@ -172,7 +172,7 @@ Code converts these into a spherical velocity vector, clamps it to the aircraft'
 
 🔬 **Reliability and latency improved simultaneously** — an unusual outcome that follows directly from the fact that short categorical outputs are both easier for the model to get right and faster to generate.
 
-Cinematic behaviour was verified to *emerge*: sustained lateral intent combined with `face_subject` yaw produces a geometrically correct orbit with no orbit routine in the codebase.
+Complex behaviour was verified to *emerge*: sustained lateral intent combined with `face_subject` yaw produces a geometrically correct orbit with no orbit routine in the codebase.
 
 ---
 
@@ -308,14 +308,14 @@ The handler that produced those lines was **absent from the currently deployed b
 
 | Mission | Environment | Result |
 |---|---|---|
-| Dark-room search, film and rock-avoiding landing | Custom raycast sim | ✅ 56 s |
-| Photorealistic subject search and filming | AI2-THOR | ✅ 38 s |
+| Dark-room search, observation and hazard-avoiding landing | Custom raycast sim | ✅ 56 s |
+| Photorealistic target search and observation | AI2-THOR | ✅ 38 s |
 | **Full autonomy** — AI selects its own subject *and* landing site | AI2-THOR | ✅ 46 s |
 | 8-stage indoor stress test with moving obstacle and wind | AI2-THOR | ✅ 98 s, 30 evasions |
 | Outdoor 8-stage mission with real flight dynamics | AirSim | ✅ 194 s |
 | Outdoor repeat with full safety layer engaged | AirSim | ✅ 112 s, 20 proximity interventions |
 | **Two-world mission** — indoor, window exit, outdoor continuation | AI2-THOR → AirSim | ✅ 12 stages |
-| **Full stack flown by real ArduPilot firmware** | AI2-THOR + SITL | ✅ armed, climbed, filmed, landed |
+| **Full stack flown by real ArduPilot firmware** | AI2-THOR + SITL | ✅ armed, climbed, observed, landed |
 
 In the full-autonomy mission the strategic model was given only the object catalogue the drone had actually detected, and selected the floor lamp over the obvious sofa, reasoning that it *"creates mood, contrast, and depth with light."* The aircraft then scored 126 candidate floor patches from its own sensor model and landed on the one with the greatest all-round clearance.
 
@@ -387,6 +387,24 @@ A sixth board was commissioned by transferring the SD card, which restored the c
 | Ground application | ✅ Functional |
 | Hardware integration | 🟡 Partial — awaiting power-system rebuild |
 | Powered flight | 🔴 Not yet performed |
+
+---
+
+## Scope note: cinematography deferred
+
+The system was originally framed around autonomous aerial cinematography, and several capabilities
+retain that heritage — a gimbal the AI aims itself, `face_subject` yaw tracking, and emergent orbits
+at a maintained radius. Mission 3 above demonstrates the system selecting a subject on aesthetic
+reasoning and filming it unaided.
+
+The project focus has since been generalised to **autonomous completion of complex multi-stage
+missions**, of which cinematography is one application. The reasoning is practical: subject
+tracking, obstacle-aware approach and precision landing are prerequisites for *any* task-completing
+drone, whereas shot grammar, jerk-limited camera trajectories and multi-shot continuity are a
+specialised layer that only becomes worth building on top of proven autonomy. A drone that cannot
+reliably complete an inspection cannot reliably film one either.
+
+Cinematography-specific work is tracked in the project roadmap as a planned upgrade.
 
 ---
 

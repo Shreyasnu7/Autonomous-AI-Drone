@@ -1,6 +1,6 @@
 # Verification
 
-Test methodology and results for the Autonomous Cinematic Drone.
+Test methodology and results for the Autonomous AI Drone.
 
 Because this system commands a physical aircraft, verification is layered: each layer tests something the layer below cannot, and the highest layers exercise **real flight-control firmware** rather than mocks.
 
@@ -136,22 +136,28 @@ Three environments were used: a custom raycast simulator (dark-room, angled-ToF 
 
 | # | Mission | Environment | Result |
 |---|---|---|---|
-| 1 | Dark-room search, film, rock-avoiding landing | Raycast | ✅ 56 s |
-| 2 | Photorealistic subject search and filming | AI2-THOR | ✅ 38 s |
+| 1 | Dark-room search, observation, hazard-avoiding landing | Raycast | ✅ 56 s |
+| 2 | Photorealistic target search and observation | AI2-THOR | ✅ 38 s |
 | 3 | **Full autonomy** — AI chooses subject *and* landing site | AI2-THOR | ✅ 46 s |
 | 4 | 8-stage indoor stress: moving obstacle, wind, unknown clutter | AI2-THOR | ✅ 98 s, 30 evasions |
 | 5 | Outdoor 8-stage with real flight dynamics | AirSim | ✅ 194 s |
 | 6 | Outdoor repeat, full safety layer engaged | AirSim | ✅ 112 s, 20 interventions |
 | 7 | **Two-world**: indoor → window exit → outdoor | AI2-THOR + AirSim | ✅ 12 stages |
-| 8 | **Full stack flown by real ArduPilot firmware** | AI2-THOR + SITL | ✅ armed, climbed, filmed, landed |
+| 8 | **Full stack flown by real ArduPilot firmware** | AI2-THOR + SITL | ✅ armed, climbed, observed, landed |
 
 ### 7.1 Autonomy demonstration (mission 3)
+
+This mission tests the hardest capability in the system: **self-directed goal selection** — the
+objective deliberately specifies *no* target and *no* landing site, so both must be chosen by the
+system from what it actually perceives. The objective was phrased in cinematographic terms at the
+time (that being the original application focus); the capability under test is domain-independent
+and applies equally to inspection or survey targets.
 
 Given only *"choose the most cinematic subject yourself, film it, then choose a safe landing spot and land"*:
 
 1. Explored for 12 s, detector catalogued: television 0.97, sofa 0.82, floor lamp 0.81, armchair, desk lamp, shelf, pillow
 2. The strategic model, given **only the objects actually detected**, selected the **floor lamp** — *"creates mood, contrast, and depth with light, fundamental to cinematography"* — over the obvious sofa
-3. Approached and orbit-filmed it for 25 s
+3. Approached and orbited it under continuous observation for 25 s
 4. Scored **126 candidate floor patches** from its own sensor model and landed on the one with the greatest all-round clearance (140 cm)
 
 ### 7.2 Live-system performance (mission on real FPV video)

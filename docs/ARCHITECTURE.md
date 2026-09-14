@@ -1,6 +1,6 @@
 # Architecture
 
-Technical design of the Autonomous Cinematic Drone control system.
+Technical design of the Autonomous AI Drone control system.
 
 ---
 
@@ -12,7 +12,7 @@ Four principles govern the system. Each was adopted for a specific engineering r
 Vision-language models are reliable at categorical spatial judgement and unreliable at continuous numeric output. The architecture places the boundary exactly there. See §3.
 
 **1.2 — No hardcoded maneuvers.**
-There is no `orbit()`, `follow()` or `approach()` function. Cinematic behaviour emerges from composing per-tick intent. A hardcoded maneuver library would make the system a macro player rather than an autonomous agent.
+There is no `orbit()`, `follow()` or `approach()` function. Complex behaviour emerges from composing per-tick intent. A hardcoded maneuver library would make the system a macro player rather than an autonomous agent.
 
 **1.3 — The AI does not duplicate the flight controller.**
 Stabilisation, wind rejection, position hold and low-level avoidance are ArduPilot's responsibilities and are handled there. The AI selects intent and flight *mode*. This keeps the aircraft controllable if the AI stops, and avoids two controllers fighting the same disturbance.
@@ -213,7 +213,7 @@ Five independent layers, ordered from model to motors. Each is active in normal 
 | Invocation | Once per objective | Every control tick |
 | Latency budget | Seconds | ~250 ms |
 | Location | Cloud | Local |
-| Output | Mission intent, subject choice, shot concept | Categorical navigation intent |
+| Output | Mission strategy, target selection, stage decomposition | Categorical navigation intent |
 | Failure mode | Mission proceeds on last known intent | Safe default; deterministic safety layers remain active |
 
 Network failure cannot stall the control loop, because no cloud call sits inside it.

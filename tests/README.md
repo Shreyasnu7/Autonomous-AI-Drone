@@ -1,6 +1,6 @@
 # Test Suite
 
-Validation harnesses for the Autonomous Cinematic Drone. See [../docs/VERIFICATION.md](../docs/VERIFICATION.md) for methodology and full results.
+Validation harnesses for the Autonomous AI Drone. See [../docs/VERIFICATION.md](../docs/VERIFICATION.md) for methodology and full results.
 
 ---
 
