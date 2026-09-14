@@ -128,6 +128,8 @@ throttle = 1500 + 0.2·250 = 1550 ✅
 
 **Upload handshake race.** Sending `mission_clear_all` before `mission_count` produced its own `MISSION_ACK`, which the handler mistook for upload completion. The firmware then reported `Mission upload timeout` and refused AUTO with `init failed`. Resolved by relying on the single `mission_count` transaction, which replaces the existing mission implicitly.
 
+**A second, unfixed uploader survived behind the legacy command path.** The corrections above were applied to the local route-mission handler only. The older `UPLOAD_MISSION` command retained its original implementation, which cleared the mission before `mission_count` and blind-blasted every item without waiting for the firmware's `MISSION_REQUEST` pulls — both faults the local path had already been fixed for. Two divergent uploaders meant a fix to one silently left the other broken. Both entry points now call a single `_begin_route_mission()`, re-verified at 10/10; the invariant that the uploaded list is always `[home, TAKEOFF, *waypoints]` is stated at that one site rather than assumed independently by each caller.
+
 ---
 
 ## 7. Layer 6 — Full-stack simulated missions

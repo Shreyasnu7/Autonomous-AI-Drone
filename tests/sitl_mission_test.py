@@ -74,6 +74,7 @@ bridge.running = True
 bridge.is_armed = False
 bridge.local_clients = set()
 for m in ("process_packet", "execute_ai_plan", "_execute_named_command",
+          "_begin_route_mission",
           "_land_backstop_disarm", "_goto_then_land", "_smart_avoidance_monitor"):
     if hasattr(BridgeCls, m):
         setattr(bridge, m, types.MethodType(getattr(BridgeCls, m), bridge))

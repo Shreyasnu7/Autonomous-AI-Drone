@@ -102,38 +102,42 @@ Movement is fully spherical: any azimuth, any climb slope, any pace, any yaw beh
 
 ```mermaid
 flowchart TB
-    subgraph GROUND["Ground Station — Laptop (RTX GPU)"]
-        direction TB
-        G1["Gemini 2.5 Flash<br/><i>strategic reasoning — one-shot</i>"]
-        G2["Qwen2.5-VL-7B-AWQ via vLLM<br/><i>continuous pilot — ~250 ms</i>"]
-        G3["YOLO-World + Depth-Anything V2<br/><i>TensorRT, threaded</i>"]
-        G4["Intent Resolver<br/><i>spherical geometry + safety</i>"]
-        G5["2.5D Spatial Fusion Grid<br/><i>LiDAR + ToF + metric depth</i>"]
+    subgraph AIR["🚁 AIRCRAFT"]
+        B3["<b>YDLIDAR X2</b><br/><i>360° scan</i>"]
+        B5["<b>ESP32 sensor hub</b><br/><i>4× VL53L1X ToF · IMU</i>"]
+        B4["<b>GoPro HERO12</b><br/><i>on gimbal</i>"]
+        B1["<b>Radxa Cubie A7Z</b><br/><i>companion computer / bridge</i>"]
+        B2["<b>ArduPilot FC — MiniPix</b><br/><i>custom build: PRX · AVOID · OA</i>"]
     end
 
-    subgraph AIR["Aircraft"]
-        direction TB
-        B1["Radxa Cubie A7Z<br/><i>companion computer / bridge</i>"]
-        B2["ArduPilot FC (MiniPix)<br/><i>custom build: PRX, AVOID, OA</i>"]
-        B3["YDLIDAR X2 · 360°"]
-        B4["GoPro HERO12 · gimbal"]
-        B5["ESP32 sensor hub<br/><i>4× VL53L1X ToF · IMU</i>"]
+    subgraph GROUND["🖥️ GROUND STATION — laptop, RTX GPU"]
+        G3["<b>Perception</b><br/>YOLO-World + Depth-Anything V2<br/><i>TensorRT FP16 · threaded</i>"]
+        G5["<b>2.5D Spatial Fusion Grid</b><br/><i>LiDAR + ToF + metric depth</i>"]
+        G1["<b>Gemini 2.5 Flash</b><br/><i>strategic reasoning · one-shot</i>"]
+        G2["<b>Qwen2.5-VL-7B-AWQ</b> via vLLM<br/><i>continuous pilot · ~209 ms</i>"]
+        G4["<b>Intent Resolver</b><br/><i>spherical geometry + safety envelope</i>"]
     end
 
-    APP["Flutter Ground App<br/><i>live video · telemetry · map missions</i>"]
-
-    G1 -->|mission strategy| G2
-    G3 --> G5
-    G5 --> G2
-    G2 -->|categorical intent| G4
-    G4 -->|velocity vector| B1
     B3 --> B1
     B5 --> B1
-    B1 -->|"OBSTACLE_DISTANCE (72 sectors)"| B2
-    B1 -->|"GUIDED setpoints / RC override"| B2
-    B4 -->|RTSP| G3
-    B1 <-->|WebSocket over Tailscale| APP
-    B1 -.->|telemetry| G5
+    B4 --> B1
+    B1 == "RTSP video" ==> G3
+    B1 -. "telemetry · LiDAR" .-> G5
+    G3 --> G5
+    G5 --> G2
+    G1 == "mission strategy" ==> G2
+    G2 == "categorical intent" ==> G4
+    G4 == "velocity vector" ==> B1
+    B1 -- "OBSTACLE_DISTANCE · 72 sectors" --> B2
+    B1 -- "GUIDED setpoints · RC override" --> B2
+    B1 <== "WebSocket over Tailscale" ==> APP["📱 <b>Flutter Ground App</b><br/><i>live video · telemetry · map missions</i>"]
+
+    classDef air fill:#0f2a24,stroke:#34d399,stroke-width:1.5px,color:#e5e7eb
+    classDef gnd fill:#15213b,stroke:#60a5fa,stroke-width:1.5px,color:#e5e7eb
+    classDef app fill:#2b2113,stroke:#f59e0b,stroke-width:1.5px,color:#e5e7eb
+    class B1,B2,B3,B4,B5 air
+    class G1,G2,G3,G4,G5 gnd
+    class APP app
 ```
 
 ### Division of responsibility
@@ -261,7 +265,7 @@ Bill of materials, wiring, and **hard-won power-integrity requirements**: [docs/
 
 ### 1 — Ground station
 ```bash
-git clone https://github.com/Shreyasnu7/autonomous-ai-drone.git && cd autonomous-ai-drone
+git clone https://github.com/Shreyasnu7/Autonomous-AI-Drone.git && cd Autonomous-AI-Drone
 pip install -r requirements.txt
 export GEMINI_API_KEY="your-key-here"
 ```

@@ -1228,6 +1228,50 @@ class RadxaBridge:
 
         return False   # not a named command -> caller falls through to execute_ai_plan
 
+    def _begin_route_mission(self, items, autostart=True, alt=None):
+        """Upload a route mission to the FC using the proper MISSION_REQUEST/ACK handshake.
+
+        Single implementation shared by every mission entry point. Two details here are
+        load-bearing and were established by SITL testing:
+
+        1. No mission_clear_all beforehand. Its own MISSION_ACK arrives first and is
+           indistinguishable from the upload-complete ACK, which produced 'Mission upload
+           timeout' followed by AUTO 'init failed'. A new mission_count transaction
+           replaces the previous mission on its own.
+        2. Items are not blind-blasted. ArduPilot pulls each item by sequence number; the
+           read loop answers MISSION_REQUEST from self._pending_mission.
+
+        The uploaded list is always [home placeholder, TAKEOFF, *waypoints], so the read
+        loop's waypoint count (len - 2) stays correct for every caller.
+
+        Returns the number of route waypoints queued, or 0 if there was nothing to send.
+        """
+        items = [it for it in (items or [])
+                 if isinstance(it, dict) and 'lat' in it and 'lng' in it]
+        if not items or not self.fc:
+            return 0
+
+        if alt is None:
+            alt = float(os.getenv('MISSION_ALT_M', '15'))
+        alt = float(alt)
+        first = items[0]
+
+        pm = [{'cmd': mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,   # seq0 = home placeholder
+               'lat': first['lat'], 'lng': first['lng'], 'alt': 0},
+              {'cmd': mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,    # seq1 = auto-takeoff
+               'lat': first['lat'], 'lng': first['lng'], 'alt': alt}]
+        pm += [{'cmd': mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+                'lat': it['lat'], 'lng': it['lng'],
+                'alt': float(it.get('alt', alt))} for it in items]
+
+        self._pending_mission = pm
+        self._mission_autostart = bool(autostart)
+        self.fc.mav.mission_count_send(
+            self.fc.target_system, self.fc.target_component, len(pm))
+        print(f"🗺️ ROUTE MISSION: {len(items)} waypoints @ {alt}m "
+              f"(+takeoff item) — handshake upload started")
+        return len(items)
+
     async def process_packet(self, type, payload):
         """Process a command from local WebSocket client (Tailscale/laptop AI).
            Routes into the same logic as command_loop but without needing cloud WS."""
@@ -1335,24 +1379,7 @@ class RadxaBridge:
         # handshake (read-loop answers each seq), and auto-start AUTO on ACK if already armed.
         if type == 'mission':
             items = payload if isinstance(payload, list) else (payload or {}).get('items', [])
-            items = [it for it in items if isinstance(it, dict) and 'lat' in it and 'lng' in it]
-            if items and self.fc:
-                alt = float(os.getenv('MISSION_ALT_M', '15'))
-                first = items[0]
-                pm = [{'cmd': mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,          # seq0 = home placeholder
-                       'lat': first['lat'], 'lng': first['lng'], 'alt': 0},
-                      {'cmd': mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,           # seq1 = auto-takeoff
-                       'lat': first['lat'], 'lng': first['lng'], 'alt': alt}]
-                pm += [{'cmd': mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
-                        'lat': it['lat'], 'lng': it['lng'], 'alt': alt} for it in items]
-                self._pending_mission = pm
-                self._mission_autostart = True
-                # NO separate mission_clear_all: its own MISSION_ACK arrives FIRST and would be
-                # mistaken for upload-complete (SITL-caught: 'Mission upload timeout' + AUTO 'init
-                # failed'). A new mission_count transaction replaces the old mission by itself.
-                self.fc.mav.mission_count_send(self.fc.target_system, self.fc.target_component, len(pm))
-                print(f"🗺️ ROUTE MISSION from app: {len(items)} waypoints @ {alt}m "
-                      f"(+takeoff item) — handshake upload started")
+            self._begin_route_mission(items, autostart=True)
             return
 
         if type == 'director_intent':
@@ -1566,25 +1593,13 @@ class RadxaBridge:
 
                     # P1.6: MISSION HANDLER (Upload Waypoints to FC)
                 elif cmd == 'UPLOAD_MISSION':
+                    # Routed through the same handshake uploader as the local path. The former
+                    # inline implementation cleared the mission first and blind-blasted items
+                    # without waiting for MISSION_REQUEST, which SITL showed fails the upload.
                     try:
-                        items = payload.get('items', [])
-                        print(f"🗺️ UPLOADING MISSION: {len(items)} Waypoints...")
-                        if items:
-                            self.fc.mav.mission_clear_all_send(self.fc.target_system, self.fc.target_component)
-                            self.fc.mav.mission_count_send(self.fc.target_system, self.fc.target_component, len(items))
-                            for i, item in enumerate(items):
-                                self.fc.mav.mission_item_int_send(
-                                    self.fc.target_system, self.fc.target_component,
-                                    i,
-                                    mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
-                                    mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
-                                    0, 1,
-                                    0, 0, 0, 0,
-                                    int(item['lat'] * 1e7),
-                                    int(item['lng'] * 1e7),
-                                    float(item.get('alt', 20))
-                                )
-                            print("✅ MISSION UPLOADED")
+                        items = payload.get('items', []) if isinstance(payload, dict) else payload
+                        if not self._begin_route_mission(items, autostart=False):
+                            print("⚠️ UPLOAD_MISSION: no valid waypoints in payload")
                     except Exception as e:
                         print(f"❌ Mission Upload Fail: {e}")
 
