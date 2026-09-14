@@ -90,3 +90,8 @@ app/**/*.iml
 *.jks
 *.keystore
 key.properties
+
+# Superseded prototype tree (kept on disk, not part of the published system)
+project_root/
+# Generated run output
+audit_output.txt

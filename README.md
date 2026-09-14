@@ -366,9 +366,20 @@ app/                            Flutter ground application (Android)
   ├─ lib/services/              Telemetry (WebSocket), media, flight recorder, state
   └─ lib/widgets/               Artificial horizon, video feed, analytics, settings
 
+cloud_ai/                       Strategic brain — Gemini director, orchestrator, mission memory
+prompts/                        Prompt templates used by the strategic brain
+
+raxda/                          Companion-side modules deployed to the aircraft by the setup scripts
+control/ + mavlink/             Direct MAVLink command primitives (arm/takeoff/move/land) and the
+                                connection layer they use — predate the bridge and are retained
+                                for bench work; the flight path in use is raxda_bridge/
+
 docs/                           Architecture, hardware, verification, deployment, build journal
 tests/                          SITL and integration harnesses
 ```
+
+Directories not listed above (`project_root/`, generated `artifacts/`) are superseded prototypes or
+run output and are excluded from version control.
 
 ---
 
