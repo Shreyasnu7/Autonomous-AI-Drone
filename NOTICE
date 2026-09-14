@@ -1,0 +1,146 @@
+Autonomous Cinematic Drone — Two-Brain Aerial Cinematography System
+Copyright 2026 Shreyash Agarwal
+
+This product includes software developed by Shreyash Agarwal.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+================================================================================
+THIRD-PARTY COMPONENTS
+================================================================================
+
+This project integrates, links against, or communicates with the following
+third-party components. Each remains under its own license. This project does
+NOT redistribute their source or binaries; they are installed independently by
+the end user via the documented setup procedure.
+
+--------------------------------------------------------------------------------
+FLIGHT CONTROL FIRMWARE
+--------------------------------------------------------------------------------
+ArduPilot (ArduCopter 4.6.x, custom build)
+    License : GPL-3.0-or-later
+    Website : https://ardupilot.org
+    Usage   : Runs as independent firmware on the flight controller hardware.
+              This project communicates with it over the MAVLink wire protocol
+              and does not link to, modify, or redistribute ArduPilot source.
+              Protocol-level communication does not create a derivative work.
+
+pymavlink
+    License : LGPL-3.0-or-later
+    Website : https://github.com/ArduPilot/pymavlink
+    Usage   : Imported as an unmodified library (dynamic linking). LGPL permits
+              use from differently licensed applications provided the library
+              itself remains under LGPL and is replaceable by the user.
+
+--------------------------------------------------------------------------------
+MACHINE LEARNING MODELS AND FRAMEWORKS
+--------------------------------------------------------------------------------
+Qwen2.5-VL-7B-Instruct-AWQ  (local vision-language pilot)
+    License : Apache-2.0
+    Source  : https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct-AWQ
+
+vLLM  (inference server)
+    License : Apache-2.0
+    Source  : https://github.com/vllm-project/vllm
+
+Depth-Anything-V2-Metric-Indoor-Small-hf  (monocular metric depth)
+    License : Apache-2.0
+    Source  : https://huggingface.co/depth-anything
+    NOTE    : Only the *Small* variant is Apache-2.0. The Large variant is
+              CC-BY-NC-4.0 (non-commercial) and is deliberately NOT used here.
+
+Ultralytics YOLOv8 / YOLO-World  (object detection)
+    License : AGPL-3.0  >>> IMPORTANT — SEE COMPLIANCE NOTE BELOW <<<
+    Source  : https://github.com/ultralytics/ultralytics
+
+    COMPLIANCE NOTE: Ultralytics is licensed AGPL-3.0, a strong copyleft
+    license whose Section 13 extends source-disclosure obligations to software
+    made available over a network. Personal, research, and educational use of
+    this project is unaffected. However, if you intend to (a) offer this system
+    as a hosted/network service, or (b) distribute it commercially, you must
+    either release the complete corresponding source of the combined work under
+    AGPL-3.0, obtain an Ultralytics Enterprise License, or replace the detector
+    with a permissively licensed alternative. The detector is isolated behind
+    the ThreadedYOLO abstraction in ai/camera_brain/laptop_ai/director_core.py
+    specifically so it can be swapped without touching the rest of the system.
+
+NVIDIA TensorRT  (inference acceleration)
+    License : NVIDIA Software License Agreement (proprietary, redistributable
+              runtime under stated terms)
+    Website : https://developer.nvidia.com/tensorrt
+
+PyTorch
+    License : BSD-3-Clause
+    Website : https://pytorch.org
+
+OpenCV
+    License : Apache-2.0 (OpenCV 4.5+)
+    Website : https://opencv.org
+
+NumPy
+    License : BSD-3-Clause
+
+--------------------------------------------------------------------------------
+CLOUD SERVICES
+--------------------------------------------------------------------------------
+Google Gemini API  (strategic director brain)
+    Terms   : Google APIs Terms of Service / Gemini API Additional Terms
+    Website : https://ai.google.dev/terms
+    Usage   : Called at runtime via the public REST API using a user-supplied
+              API key. No Google code is vendored in this repository.
+
+--------------------------------------------------------------------------------
+SIMULATION AND VALIDATION (development-time only, not shipped)
+--------------------------------------------------------------------------------
+AI2-THOR  (photorealistic indoor simulation)
+    License : Apache-2.0
+    Website : https://ai2thor.allenai.org
+
+Microsoft AirSim  (outdoor flight-dynamics simulation)
+    License : MIT
+    Website : https://github.com/microsoft/AirSim
+
+ArduPilot SITL  (software-in-the-loop firmware validation)
+    License : GPL-3.0-or-later
+    Usage   : Executed as a separate process during validation only.
+
+--------------------------------------------------------------------------------
+MEDIA AND TRANSPORT INFRASTRUCTURE
+--------------------------------------------------------------------------------
+MediaMTX  (WebRTC/RTSP media server)
+    License : MIT
+    Website : https://github.com/bluenviron/mediamtx
+
+FFmpeg  (video transcoding)
+    License : LGPL-2.1-or-later / GPL-2.0-or-later depending on build
+    Website : https://ffmpeg.org
+    Usage   : Invoked as an external binary via subprocess; not linked.
+
+Tailscale  (encrypted mesh networking)
+    License : BSD-3-Clause (client)
+    Website : https://tailscale.com
+
+Flutter  (mobile ground-station application)
+    License : BSD-3-Clause
+    Website : https://flutter.dev
+
+================================================================================
+HARDWARE DESIGN FILES
+================================================================================
+Wiring diagrams, bill of materials, and integration documentation contained in
+docs/HARDWARE.md are released under the same Apache-2.0 terms as the software.
+Referenced commercial hardware (Radxa, Matek, YDLIDAR, GoPro, Espressif) remains
+the property of the respective manufacturers.
+
+================================================================================
+SAFETY DISCLAIMER
+================================================================================
+This software commands physical aircraft capable of causing injury, death, and
+property damage. It is provided WITHOUT WARRANTY OF ANY KIND as stated in
+Sections 7 and 8 of the Apache License. The operator bears sole and complete
+responsibility for safe operation and for compliance with all applicable
+aviation regulations in their jurisdiction. See SAFETY.md before operating.
