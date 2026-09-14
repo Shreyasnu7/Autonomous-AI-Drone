@@ -95,15 +95,34 @@ class AutopilotController:
         Input: meters/second
         """
         if not self.connected or not self.master:
-            # REMOTE MODE: Send to Server via Websocket
+            # REMOTE MODE: Send to Server via Websocket.
+            # The bridge reads the velocity from data['payload'] (process_packet(type, payload)),
+            # so it MUST be nested under "payload" — top-level vx/vy/vz were silently dropped
+            # (payload=None -> isinstance check failed -> no RC override -> motors never moved).
             if self.messaging:
+                # Rate-limit + dedupe: Qwen(16fps)+Pi0(50Hz)+avoidance all call this every tick, which
+                # flooded the WS with identical hover commands -> ConnectionClosedError / WinError 121,
+                # dropping the link mid-flight. Cap the stream at ~15Hz; for an UNCHANGED command resend
+                # only every 0.25s (4Hz keep-alive — keeps the FC's velocity from timing out, no flood).
+                import time as _t
+                _now = _t.time()
+                _v = (round(vx, 3), round(vy, 3), round(vz, 3), round(yaw_rate, 3))
+                _last = getattr(self, '_last_vel', None)
+                _lt = getattr(self, '_last_vel_t', 0.0)
+                _changed = (_last is None) or any(abs(a - b) > 0.02 for a, b in zip(_v, _last))
+                if (_now - _lt) < 0.066:
+                    return                              # hard cap ~15 Hz
+                if not _changed and (_now - _lt) < 0.25:
+                    return                              # unchanged hover -> keep-alive at most 4 Hz
+                self._last_vel = _v
+                self._last_vel_t = _now
                 cmd = {
                     "type": "cmd_vel",
-                    "vx": vx, "vy": vy, "vz": vz, "yaw_rate": yaw_rate,
+                    "payload": {"vx": vx, "vy": vy, "vz": vz, "yaw_rate": yaw_rate},
                     "target": "drone" # Forward to drone
                 }
                 asyncio.create_task(self.messaging.send(cmd))
-            return 
+            return
             
         # Create SET_POSITION_TARGET_LOCAL_NED message
         # type_mask: ignore pos, accel, only accept vel

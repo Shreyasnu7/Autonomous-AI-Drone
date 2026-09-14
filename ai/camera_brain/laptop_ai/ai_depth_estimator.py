@@ -9,14 +9,21 @@ Models (auto-selected by available compute):
 - MiDaS v3.1 DPT-Hybrid: Good balance, ~100ms/frame on RTX GPU
 - MiDaS v2.1 Small: Fastest, ~30ms/frame, works on CPU
 
-Depth output is RELATIVE (not metric) — normalized 0..1 where:
-    0.0 = farthest (sky/background)
+Primary model is Depth-Anything-V2-Metric-Indoor-Small (TRUE METRIC depth, in METRES) — chosen
+2026-07-05 after proving the old relative-depth "clearance cm" was a scale-broken hack
+(400*(1-normalized) compresses every distance into ~170-360cm; on real FPV frames it disagreed with
+true metric depth on 45% of frames about which way was most open). The metric model is the same
+size/speed (~55ms GPU) so this is a free, strict upgrade for obstacle clearance.
+
+estimate() STILL returns a RELATIVE map normalized 0..1 (1.0=closest, 0.0=farthest) so the cosmetic
+callers below are unchanged. For real obstacle distances use estimate_metric_cm() / the metres map.
+    0.0 = farthest (background)
     1.0 = closest (foreground)
 
 Used by:
-- ai_autofocus.py: Focus distance estimation
-- ai_camera_brain.py: Depth-aware exposure/composition
-- obstacle_warp.py: Monocular obstacle detection (when no ToF/LiDAR)
+- ai_autofocus.py: Focus distance estimation            (uses the 0..1 relative map)
+- ai_camera_brain.py: Depth-aware exposure/composition   (uses the 0..1 relative map)
+- obstacle_warp.py: Monocular obstacle detection         (should use estimate_metric_cm — real metres)
 """
 import numpy as np
 import logging
@@ -73,9 +80,15 @@ class AIDepthEstimator:
         self._initialized = False
         self._frame_count = 0
         self._total_time = 0.0
+        self.backend = 'fallback'   # 'depth_anything' | 'midas' | 'fallback'
+        self.da_pipe = None
+        self.is_metric = False       # True when the loaded model outputs real metres
+        self._last_metric_m = None   # last frame's metric depth map (float32 [H,W], metres)
 
         if _MIDAS_AVAILABLE:
-            self._init_midas()
+            # Prefer Depth Anything V2 (modern SOTA, faster + more accurate than MiDaS)
+            if not self._init_depth_anything():
+                self._init_midas()
 
     def _init_midas(self):
         """Load MiDaS model. Auto-selects best model for available hardware."""
@@ -143,9 +156,71 @@ class AIDepthEstimator:
 
         h, w = frame.shape[:2]
 
-        if self._initialized:
+        if self.backend == 'depth_anything':
+            return self._estimate_depth_anything(frame, h, w)
+        elif self._initialized:
             return self._estimate_midas(frame, h, w)
         else:
+            return self._estimate_fallback(frame, h, w)
+
+    # Metric (indoor) model = real metres; falls back to the relative Small model if unavailable.
+    DA_METRIC_MODEL = "depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf"
+    DA_RELATIVE_MODEL = "depth-anything/Depth-Anything-V2-Small-hf"
+
+    def _init_depth_anything(self):
+        """Load Depth Anything V2. Prefer the METRIC-Indoor model (real metres for obstacle
+        clearance); if that can't load, fall back to the relative Small model (still 0..1 output)."""
+        from transformers import pipeline
+        dev = 0 if (self.use_gpu and _torch.cuda.is_available()) else -1
+        for model_id, metric in ((self.DA_METRIC_MODEL, True), (self.DA_RELATIVE_MODEL, False)):
+            try:
+                self.da_pipe = pipeline("depth-estimation", model=model_id, device=dev)
+                self.backend = 'depth_anything'
+                self.is_metric = metric
+                self.model_type = 'DepthAnythingV2-Metric-Indoor-Small' if metric else 'DepthAnythingV2-Small'
+                self.device = _torch.device('cuda' if dev == 0 else 'cpu')
+                self._initialized = True
+                logger.info(f"Depth Anything V2 loaded: {self.model_type} (metric={metric})")
+                return True
+            except Exception as e:
+                logger.error(f"Depth Anything init failed for {model_id}: {e}")
+        logger.error("Both Depth Anything variants failed — trying MiDaS")
+        return False
+
+    def _estimate_depth_anything(self, frame, h, w):
+        """Depth Anything V2 inference. Returns (relative 0..1 map [1.0=closest], mask).
+        When the METRIC model is loaded, predicted_depth is real METRES (higher = farther), so we
+        cache it in self._last_metric_m and INVERT it for the 0..1 closeness map (keeps the old
+        convention for the cosmetic callers). The relative model's output is already 'higher=closer'."""
+        start = time.time()
+        try:
+            import cv2
+            from PIL import Image
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            out = self.da_pipe(Image.fromarray(rgb))
+            depth_raw = out["predicted_depth"].squeeze().detach().cpu().numpy().astype(np.float32)
+            depth_raw = cv2.resize(depth_raw, (w, h))
+            dmin, dmax = float(depth_raw.min()), float(depth_raw.max())
+            if self.is_metric:
+                self._last_metric_m = depth_raw                          # real metres (higher = farther)
+                depth = 1.0 - (depth_raw - dmin) / (dmax - dmin) if dmax > dmin else np.zeros_like(depth_raw)
+            else:
+                self._last_metric_m = None                               # relative: higher already = closer
+                depth = (depth_raw - dmin) / (dmax - dmin) if dmax > dmin else np.zeros_like(depth_raw)
+            threshold = np.percentile(depth, 70)
+            mask = np.zeros((h, w), dtype=np.uint8)
+            mask[depth > threshold] = 255
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            elapsed = time.time() - start
+            self._frame_count += 1
+            self._total_time += elapsed
+            if self._frame_count % 100 == 0:
+                logger.info(f"Depth(DAv2): avg {self._total_time/self._frame_count*1000:.0f}ms/frame")
+            return depth.astype(np.float32), mask
+        except Exception as e:
+            logger.error(f"Depth Anything inference failed: {e}")
             return self._estimate_fallback(frame, h, w)
 
     def _estimate_midas(self, frame, h, w):
@@ -276,6 +351,30 @@ class AIDepthEstimator:
         x = max(0, min(int(x), w - 1))
         y = max(0, min(int(y), h - 1))
         return float(depth_map[y, x])
+
+    def estimate_metric_cm(self, frame, band=(0.30, 0.62), pct=10):
+        """Real-distance obstacle clearance for LEFT/CENTER/RIGHT, in CENTIMETRES.
+        Reads the metric-metres map over a HORIZON band at ~flight height and returns the nearest
+        obstacle distance (pct-th percentile) per third. The default band (0.30-0.62 of frame height)
+        sits at the horizon to EXCLUDE the floor — a wider/lower band makes the ground dominate and all
+        three thirds read ~1m (the floor). NOTE the exact band should be field-calibrated to the real
+        camera pitch/mount; this default suits a roughly level forward-facing GoPro.
+        Returns (L_cm, C_cm, R_cm) ints, or None if the relative (non-metric) model is loaded."""
+        if frame is None:
+            return None
+        self.estimate(frame)                       # populates self._last_metric_m when metric
+        m = self._last_metric_m
+        if m is None:                              # relative model — no true metres available
+            return None
+        H, W = m.shape[:2]
+        b = m[int(H * band[0]):int(H * band[1])]
+        thirds = (b[:, :W // 3], b[:, W // 3:2 * W // 3], b[:, 2 * W // 3:])
+        # pct-th percentile = nearest surface in that third (robust to a few noisy pixels)
+        return tuple(int(np.percentile(t, pct) * 100) for t in thirds)
+
+    def get_last_metric_depth(self):
+        """The last frame's metric depth map in METRES (float32 [H,W]), or None if relative model."""
+        return self._last_metric_m
 
     def get_depth_stats(self):
         """Performance statistics."""

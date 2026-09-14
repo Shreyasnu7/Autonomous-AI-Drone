@@ -22,26 +22,39 @@
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_NeoPixel.h>
-#include <ESP32Servo.h>
 #include <ArduinoJson.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
 
-// --- WIFI CONFIGURATION ---
-// ESP32 connects to the Cubie A7Z's own WiFi hotspot (DroneAP)
-// 4G dongle handles internet separately via USB
-const char* wifi_ssid = "DroneAP";            // Cubie A7Z hotspot name
-const char* wifi_password = "dronepass123";    // Cubie A7Z hotspot password
+// --- WIFI CONFIGURATION (Multi-network auto-fallback) ---
+// ESP32 tries each WiFi network in order until one connects
+// Network 1: Cubie's own DroneAP hotspot (primary for drone flight)
+// Network 2: Phone hotspot (for development/testing)
+// Network 3: 4G dongle WiFi (alternative)
+
+struct WiFiConfig {
+    const char* ssid;
+    const char* password;
+    IPAddress radxa_ip;
+};
+
+WiFiConfig networks[] = {
+    {"Excitel_2.4G_188909681", "8003390975", IPAddress(192, 168, 1, 14)}, // Home WiFi - PRIMARY (Radxa can ONLY use this; ESP joins here too)
+    {"DroneAP",     "dronepass123",  IPAddress(10, 42, 0, 1)},      // Cubie's own AP (future flight)
+    {"S21 ultra",   "22219413",      IPAddress(10, 195, 147, 217)}, // Phone hotspot (Radxa can't see it - last resort)
+    {"4G-UFI-224D", "1234567890",    IPAddress(192, 168, 100, 98)}  // 4G dongle WiFi
+};
+const int NUM_NETWORKS = 4;
 
 WiFiUDP udp;
-IPAddress radxa_ip(10, 42, 0, 1);              // Cubie A7Z IP on its own hotspot
+IPAddress radxa_ip(10, 42, 0, 1);  // Will be updated when connected
 uint16_t radxa_port = 8888;
 
 // --- PIN CONFIGURATION ---
 #define LED_PIN 33
 #define NUM_LEDS 32
 #define LEDS_PER_ARM 8
-#define BRIGHTNESS 150
+#define BRIGHTNESS 70   // Reduced from 150: halves LED current draw (single power module)
 
 #define PIN_GIM_PITCH 25
 #define PIN_GIM_YAW 32
@@ -61,7 +74,6 @@ uint16_t radxa_port = 8888;
 Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
 Adafruit_MPU6050 mpu;
 VL53L1X tof1, tof2, tof3, tof4;
-Servo gimPitch, gimYaw;
 
 // --- STATE VARIABLES ---
 bool bus_alive = false;
@@ -70,6 +82,8 @@ bool t1=false, t2=false, t3=false, t4=false; // Init success flags
 int init_stage = 0;
 unsigned long init_timer = 0;
 bool is_armed = false;
+unsigned long last_wifi_check = 0;
+int connected_network_idx = 0; // Which network[] entry we're on
 
 float g_ax, g_ay, g_az;
 float g_gx, g_gy, g_gz;
@@ -77,6 +91,22 @@ int CurrentPitch = 90;
 int CurrentYaw = 90;
 int dist1=-1, dist2=-1, dist3=-1, dist4=-1;
 
+// --- LIVE I2C SCANNER (diagnostic: shows what's actually on the bus) ---
+String i2c_found = "scanning";
+unsigned long last_i2c_scan = 0;
+void scanI2C() {
+    String found = "";
+    for (uint8_t addr = 1; addr < 127; addr++) {
+        Wire.beginTransmission(addr);
+        if (Wire.endTransmission() == 0) {
+            char buf[8]; sprintf(buf, "0x%02X ", addr);
+            found += buf;
+        }
+    }
+    i2c_found = (found.length() > 0) ? found : "NONE";
+}
+
+// --- SERVO LOGIC REMOVED (backup: esp32_firmware_BACKUP_with_servos_2026-06-21.ino) ---
 bool stabilize_active = false;
 bool manual_led_override = false;
 const float PITCH_GAIN = 1.2; 
@@ -310,28 +340,63 @@ void runLEDs() {
     strip.show();
 }
 
+// ===== SERVO HELPERS REMOVED (gimbal servos disabled for now) =====
+
+// --- SENSOR INIT (reusable: called at boot AND for live self-healing) ---
+// Returns true if the PCA9548A mux is found and sensors initialized.
+bool initSensors() {
+    Wire.beginTransmission(PCA_ADDR);
+    if (Wire.endTransmission() != 0) {
+        bus_alive = false;
+        return false;            // PCA not on the bus yet — nothing to init
+    }
+    Serial.println("PCA9548A FOUND");
+    bus_alive = true;
+
+    t1 = initTOF(tof1, PIN_XSHUT1, 0x30);
+    t2 = initTOF(tof2, PIN_XSHUT2, 0x31);
+    t3 = initTOF(tof3, PIN_XSHUT3, 0x32);
+    t4 = initTOF(tof4, PIN_XSHUT4, 0x33);
+
+    selectChannel(SHARED_PCA_CHANNEL); delay(10);
+    if (mpu.begin()) {
+        Serial.println("MPU6050 OK");
+        mpu_active = true;
+        mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+        mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+        mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+    } else {
+        Serial.println("MPU6050 NOT FOUND");
+        mpu_active = false;
+    }
+    return true;
+}
+
 // --- SETUP ---
 void setup() {
+    // Full speed from the start — instant boot (motors are the only heavy load,
+    // and they're handled separately; LEDs + sensors start immediately).
     pinMode(PIN_XSHUT1, OUTPUT); digitalWrite(PIN_XSHUT1, LOW);
     pinMode(PIN_XSHUT2, OUTPUT); digitalWrite(PIN_XSHUT2, LOW);
     pinMode(PIN_XSHUT3, OUTPUT); digitalWrite(PIN_XSHUT3, LOW);
     pinMode(PIN_XSHUT4, OUTPUT); digitalWrite(PIN_XSHUT4, LOW);
-    pinMode(PIN_ONBOARD, OUTPUT); digitalWrite(PIN_ONBOARD, HIGH); 
-    
-    Serial.begin(115200);   
+    pinMode(PIN_ONBOARD, OUTPUT); digitalWrite(PIN_ONBOARD, HIGH);
+
+    Serial.begin(115200);
     Serial2.begin(115200);
 
-    // --- LED DIAGNOSTIC ---
-    strip.begin(); 
+    // LEDs ON instantly
+    strip.begin();
     strip.setBrightness(BRIGHTNESS);
-    Serial.println("LED DIAG: RED"); strip.fill(strip.Color(255,0,0)); strip.show(); delay(300);
-    Serial.println("LED DIAG: GREEN"); strip.fill(strip.Color(0,255,0)); strip.show(); delay(300);
-    Serial.println("LED DIAG: BLUE"); strip.fill(strip.Color(0,0,255)); strip.show(); delay(300);
-    Serial.println("LED DIAG: WHITE"); strip.fill(strip.Color(255,255,255)); strip.show(); delay(300);
-    strip.fill(0); strip.show(); 
+    strip.fill(0); strip.show();
 
+    // Enable ESP32 internal pull-ups on SDA/SCL — rescues a dead I2C bus if the
+    // PCA/sensor board has no external pull-up resistors (common cause of [NONE]).
+    pinMode(21, INPUT_PULLUP);
+    pinMode(22, INPUT_PULLUP);
     Wire.begin(21, 22);
-    delay(500);
+    Wire.setClock(100000);   // 100kHz — safest/most tolerant of weak pull-ups & long wires
+    delay(50);
 
     Serial.println("\n--- System Boot (PCA9548A Mode) ---");
 
@@ -340,63 +405,59 @@ void setup() {
     C_WHITE = strip.Color(255, 255, 255); C_ORANGE = strip.Color(255, 100, 0); C_CYAN = strip.Color(0, 255, 255);
     C_PURPLE = strip.Color(200, 0, 255); C_GOLD = strip.Color(255, 200, 0); C_BLACK = 0;
 
-    // 2. CHECK PCA
-    Wire.beginTransmission(PCA_ADDR);
-    if (Wire.endTransmission() != 0) {
-        Serial.println("❌ PCA9548A NOT FOUND");
-        strip.fill(C_RED); strip.show();
-        bus_alive = false;
-    } else {
-        Serial.println("✅ PCA9548A FOUND");
-        bus_alive = true;
-    }
+    // LEDs ON instantly (all arms blue) — before WiFi so there's no wait
+    for (int arm = 0; arm < 4; arm++) setArm(arm, C_BLUE);
+    strip.show();
 
-    if(bus_alive) {
-        // 3. INIT TOF
-        Serial.println("Init TOF Sensors...");
-        t1 = initTOF(tof1, PIN_XSHUT1, 0x30);
-        t2 = initTOF(tof2, PIN_XSHUT2, 0x31);
-        t3 = initTOF(tof3, PIN_XSHUT3, 0x32);
-        t4 = initTOF(tof4, PIN_XSHUT4, 0x33);
-
-        // 4. INIT MPU
-        selectChannel(SHARED_PCA_CHANNEL); delay(10);
-        if(mpu.begin()) {
-             Serial.println("✅ MPU6050 OK");
-             mpu_active = true;
-             mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
-             mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-             mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-        } else {
-             Serial.println("❌ MPU6050 NOT FOUND");
-             mpu_active = false;
-        }
-
-        if(mpu_active || t1 || t2 || t3 || t4) {
-             strip.fill(C_GREEN); strip.show(); // READY
-        }
-    }
-
-    gimPitch.attach(PIN_GIM_PITCH); 
-    gimYaw.attach(PIN_GIM_YAW);
-    gimPitch.write(90); 
-    gimYaw.write(90);
+    // 2. CHECK PCA + sensors (will auto-retry in loop() if not found now)
+    Serial.println("Checking sensor bus...");
+    if (!initSensors()) Serial.println("PCA9548A NOT FOUND (will keep retrying)");
 
     // --- WIFI CONNECTION ---
-    Serial.print("Connecting to WiFi: ");
-    Serial.println(wifi_ssid);
-    WiFi.begin(wifi_ssid, wifi_password);
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
-        Serial.print(".");
+    WiFi.mode(WIFI_STA);
+
+    bool wifi_connected = false;
+    for (int n = 0; n < NUM_NETWORKS && !wifi_connected; n++) {
+        Serial.print("Trying WiFi: ");
+        Serial.println(networks[n].ssid);
+        WiFi.begin(networks[n].ssid, networks[n].password);
+
+        int attempts = 0;
+        while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+            delay(500);
+            Serial.print(".");
+            attempts++;
+        }
+
+        if (WiFi.status() == WL_CONNECTED) {
+            radxa_ip = networks[n].radxa_ip;
+            connected_network_idx = n;
+            Serial.print("\nConnected to: ");
+            Serial.println(networks[n].ssid);
+            Serial.print("   ESP32 IP: ");
+            Serial.println(WiFi.localIP());
+            wifi_connected = true;
+        } else {
+            Serial.println(" Failed");
+            WiFi.disconnect();
+        }
     }
-    Serial.print("\n✅ Connected! IP: ");
-    Serial.println(WiFi.localIP());
+
+    if (!wifi_connected) {
+        Serial.println("No WiFi! Retrying first network...");
+        WiFi.begin(networks[0].ssid, networks[0].password);
+        int t = 0;
+        while (WiFi.status() != WL_CONNECTED && t < 40) { delay(1000); t++; }
+        radxa_ip = networks[0].radxa_ip;
+    }
+
     udp.begin(radxa_port);
-    Serial.println("✅ UDP Ready on port 8888");
-    
+    Serial.println("UDP Ready on port 8888");
+
+    // ===== Servos removed — no gimbal init =====
+    CurrentPitch = 90; CurrentYaw = 90;
+
     Serial.println("\n--- SETUP COMPLETE: Starting Loop ---\n");
-    delay(2000); 
 }
 
 const int CL_MAX = 256;
@@ -424,12 +485,10 @@ void checkCommand(Stream &s) {
                         else currentMode = M_IDLE;
                     }
                     if (doc.containsKey("gim")) {
-                        stabilize_active = false; 
+                        // servos removed — just track commanded angles for telemetry
                         int p = doc["gim"][0]; int y = doc["gim"][1];
                         CurrentPitch = map(p, -90, 90, 0, 180);
                         CurrentYaw = map(y, -90, 90, 0, 180);
-                        gimPitch.write(CurrentPitch);
-                        gimYaw.write(CurrentYaw);
                     }
                     if (doc.containsKey("stab")) stabilize_active = doc["stab"];
                     if (doc.containsKey("mode")) {
@@ -453,6 +512,44 @@ void loop() {
     runLEDs();
     checkCommand(Serial);
 
+    // SELF-HEALING CHECKER: every 2s while the bus is down, scan I2C and try to
+    // (re)initialize sensors. The moment the PCA wiring is good, sensors come up
+    // live and the red error LEDs clear themselves — no reboot needed.
+    if (!bus_alive && millis() - last_i2c_scan > 2000) {
+        last_i2c_scan = millis();
+        scanI2C();          // diagnostic: list what's actually on the bus
+        if (initSensors()) {
+            Serial.println("✅ Sensor bus RECOVERED — sensors online!");
+            currentMode = M_IDLE;   // leave error state
+        }
+    }
+
+    // WiFi reconnection check (every 5 seconds)
+    if (millis() - last_wifi_check > 5000) {
+        last_wifi_check = millis();
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("⚠️ WiFi lost! Reconnecting...");
+            WiFi.disconnect();
+            delay(100);
+            // Try all networks in order
+            for (int n = 0; n < NUM_NETWORKS; n++) {
+                WiFi.begin(networks[n].ssid, networks[n].password);
+                int attempts = 0;
+                while (WiFi.status() != WL_CONNECTED && attempts < 10) {
+                    delay(250);
+                    attempts++;
+                }
+                if (WiFi.status() == WL_CONNECTED) {
+                    radxa_ip = networks[n].radxa_ip;
+                    connected_network_idx = n;
+                    Serial.print("✅ Reconnected to: "); Serial.println(networks[n].ssid);
+                    break;
+                }
+                WiFi.disconnect();
+            }
+        }
+    }
+
     // MA-19 FIX: Also check for commands arriving via UDP (bridge sends via WiFi UDP)
     int packetSize = udp.parsePacket();
     if (packetSize > 0) {
@@ -465,29 +562,36 @@ void loop() {
             udpCmd.trim();
             if (udpCmd.startsWith("{")) {
                 StaticJsonDocument<256> cmdDoc;
-                if (deserializeJson(cmdDoc, udpCmd) == DeserializationOk) {
+                DeserializationError udpErr = deserializeJson(cmdDoc, udpCmd);
+                if (!udpErr) {
+                    // Armed state: {"armed": true/false}
+                    if (cmdDoc.containsKey("armed")) {
+                        is_armed = cmdDoc["armed"].as<bool>();
+                        manual_led_override = false;
+                        currentMode = is_armed ? M_ARMED : M_IDLE;
+                    }
                     // Gimbal command: {"gim": [pitch, yaw]}
                     if (cmdDoc.containsKey("gim")) {
+                        // servos removed — track commanded angles only
                         int p = cmdDoc["gim"][0];
                         int y = cmdDoc["gim"][1];
                         CurrentPitch = constrain(map(p, -90, 90, 0, 180), 10, 170);
                         CurrentYaw = constrain(map(y, -90, 90, 45, 135), 45, 135);
-                        gimPitch.write(CurrentPitch);
-                        gimYaw.write(CurrentYaw);
-                        stabilize_active = false; // Manual gimbal overrides stabilization
+                        stabilize_active = false;
                     }
                     // LED command: {"led": "RED"}
                     if (cmdDoc.containsKey("led")) {
                         String color = cmdDoc["led"].as<String>();
+                        manual_led_override = true;
                         // Map color string to LED mode
-                        if (color == "RED") currentMode = 99;
-                        else if (color == "BLUE") currentMode = 3;
-                        else if (color == "GREEN") currentMode = 1;
-                        else if (color == "OFF") currentMode = 0;
+                        if (color == "RED") currentMode = M_BATTERY_LOW;      // Flash red
+                        else if (color == "BLUE") currentMode = M_HOVER;      // Pulse blue
+                        else if (color == "GREEN") currentMode = M_AI_MODE;   // Matrix green
+                        else if (color == "OFF") { currentMode = M_IDLE; manual_led_override = false; }
                     }
                     // Mode command: {"mode": 16}
                     if (cmdDoc.containsKey("mode")) {
-                        currentMode = cmdDoc["mode"].as<int>();
+                        currentMode = (FlightMode)cmdDoc["mode"].as<int>();
                     }
                     // Stabilization toggle: {"stab": true/false}
                     if (cmdDoc.containsKey("stab")) {
@@ -508,13 +612,12 @@ void loop() {
              g_gx = g.gyro.x; g_gy = g.gyro.y; g_gz = g.gyro.z;
              
              if (stabilize_active) {
+                 // servos removed — compute stabilization angles for telemetry only
                  float pitch_deg = (atan2(g_ax, g_az) * 180.0) / PI;
                  int s_pitch = 90 + (int)(pitch_deg * PITCH_GAIN * PITCH_DIR);
                  int s_yaw = 90 - (int)(g_gz * 10.0 * YAW_GAIN * YAW_DIR);
                  CurrentPitch = constrain(s_pitch, 10, 170);
                  CurrentYaw = constrain(s_yaw, 45, 135);
-                 gimPitch.write(CurrentPitch);
-                 gimYaw.write(CurrentYaw);
             }
          }
     }
@@ -526,19 +629,40 @@ void loop() {
 
     // TELEMETRY (UDP + Serial Debug)
     if (millis() - last_telem > 100) { // 10Hz Update
-        StaticJsonDocument<512> doc;
+        StaticJsonDocument<1024> doc;
         doc["t1"] = dist1; doc["t2"] = dist2; 
         doc["t3"] = dist3; doc["t4"] = dist4;
         doc["ax"] = g_ax; doc["ay"] = g_ay; doc["az"] = g_az;
         doc["gx"] = g_gx; doc["gy"] = g_gy; doc["gz"] = g_gz;
         doc["gp"] = CurrentPitch; doc["cy"] = CurrentYaw;  // MA-20 FIX: was "gy" which overwrote gyro Y
-        doc["lm"] = (int)currentMode; 
+        doc["lm"] = (int)currentMode;
+
+        // DIAGNOSTIC FIELDS (so we can debug through the Radxa without USB)
+        doc["pca"]  = bus_alive ? 1 : 0;     // I2C mux / sensor bus alive?
+        doc["i2c"]  = i2c_found;              // live list of I2C addresses found on the bus
+        doc["mpu"]  = mpu_active ? 1 : 0;     // MPU6050 found?
+        doc["s1"]   = t1 ? 1 : 0;             // ToF sensors that initialized
+        doc["s2"]   = t2 ? 1 : 0;
+        doc["s3"]   = t3 ? 1 : 0;
+        doc["s4"]   = t4 ? 1 : 0;
+        doc["rssi"] = WiFi.RSSI();            // WiFi signal strength (dBm)
+        doc["ip"]   = WiFi.localIP().toString();
+        doc["up"]   = (unsigned long)(millis() / 1000); // uptime sec (resets to 0 = ESP rebooted!)
 
         String json_str;
         serializeJson(doc, json_str);
-        
-        // UDP Send
+
+        // WIRE LINK (most reliable): stream over UART to the Radxa (/dev/ttyAS1 once
+        // the wire is on pin 18). "ESPJSON:" prefix lets the Radxa pick it out of logs.
+        Serial.print("ESPJSON:");
+        Serial.println(json_str);
+
+        // WiFi UDP — unicast to known Radxa IP AND broadcast (reaches Radxa on ANY IP)
         udp.beginPacket(radxa_ip, radxa_port);
+        udp.print(json_str);
+        udp.endPacket();
+
+        udp.beginPacket(IPAddress(255,255,255,255), radxa_port);
         udp.print(json_str);
         udp.endPacket();
 

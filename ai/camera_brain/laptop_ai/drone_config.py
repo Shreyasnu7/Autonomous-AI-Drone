@@ -269,7 +269,7 @@ class DroneConfig:
         if battery['current'] <= 0:
             # No current draw data, use conservative estimate
             # At hover: ~15A for F450 1.5kg
-            # 8400mAh / 15A = 0.56h = 33min full battery
+            # 5400mAh 3S 60C / 15A = 0.36h = ~21min full battery
             estimated_current = 15.0  # A
         else:
             estimated_current = battery['current']

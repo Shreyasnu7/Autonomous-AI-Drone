@@ -38,6 +38,7 @@ import traceback
 import cv2
 import numpy as np
 import threading
+import math
 import aiohttp # NEW
 from ultralytics import YOLO
 from typing import Optional, List, Dict, Any
@@ -88,6 +89,7 @@ from laptop_ai.deepstream_handler import DeepStreamHandler
 from laptop_ai.pi0_pilot import Pi0Pilot
 from laptop_ai.gemini_live_brain import GeminiLiveBrain
 from laptop_ai.local_er_brain import LocalERBrain  # Qwen 2.5 VL 3B local pilot
+from laptop_ai import hybrid_control  # deterministic maneuver library + sequencer (AI=intent, code=precise)
 # Add cloud_ai path if needed, or assume relative import works if cloud_ai is sibling
 try:
     from cloud_ai.gemini_director import GeminiDirector
@@ -125,8 +127,20 @@ from laptop_ai.config import TEMPORAL_SMOOTHING, FRAME_SKIP, TEMP_ARTIFACT_DIR, 
 
 # USER CONFIG: Streaming from Cloud Proxy (Radxa -> Cloud -> Laptop)
 # USER CONFIG: Streaming from Cloud Proxy (Radxa -> Cloud -> Laptop)
-RTSP_URL = "https://drone-server-r0qe.onrender.com/video_feed"  
-# Note: Laptop uses Requests/CV2 to pull MJPEG stream from this URL
+RTSP_URL = "rtsp://100.89.83.125:8554/gopro"  # MediaMTX clean H264 feed (GoPro -> Radxa re-encode)
+# Lidar->FC alignment, found by push calibration (calibrate_lidar.py).
+# LIDAR_FRONT_BEARING_DEG = the RAW lidar bearing that points along the FC's forward axis.
+# LIDAR_HANDED: -1 maps the (CCW) lidar into the grid's mirrored (front=-y,right=+x) frame
+#   [rotation + reflection — correct for a standard CCW lidar]; +1 = pure rotation.
+#   If front is right but LEFT/RIGHT come out swapped on the map, flip this to +1.
+LIDAR_FRONT_BEARING_DEG = float(os.getenv("LIDAR_FRONT_BEARING_DEG", "42.8"))
+LIDAR_HANDED = int(os.getenv("LIDAR_HANDED", "-1"))
+# Low-latency RTSP over TCP for OpenCV/ffmpeg
+# TCP RTSP over the lossy Tailscale DERP relay: UDP was DROPPING packets -> h264 corruption ("error
+# while decoding MB") + 30s stream stalls. TCP retransmits, so the stream STAYS UP. To avoid the old
+# TCP-backlog lag, keep a SMALL buffer + cap max_delay at 0.3s; the threaded reader keeps only newest.
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|max_delay;300000|buffer_size;131072"
+# Note: Laptop pulls H264 RTSP from MediaMTX on the Radxa (Tailscale)
 
 
 # FRAME_SKIP = 1 # Controlled by Config now
@@ -143,10 +157,53 @@ class ThreadedYOLO:
     """
     Runs YOLO inference in a separate thread to avoid blocking the render loop.
     """
+    # Drone-relevant open-vocabulary classes for YOLO-World (semantic obstacles COCO lacks).
+    WORLD_CLASSES = ["chair", "table", "sofa", "couch", "doorway", "door", "wall", "person",
+                     "potted plant", "refrigerator", "tv", "window", "cabinet", "stairs", "box",
+                     "shelf", "lamp", "obstacle", "furniture", "pillar", "railing"]
+
     def __init__(self, model_path):
         import time
         import threading
-        self.model = YOLO(model_path)
+        self.conf = float(os.getenv("YOLO_CONF", "0.35"))
+        self.is_world = False
+        # OPT-IN: YOLO-World open-vocabulary detector (YOLO_WORLD=1) — prompt-driven, identifies the
+        # doorway/wall/window/etc COCO's fixed 80 classes miss. Falls back to the COCO model if the
+        # YOLO-World weights or its CLIP dep aren't available (keeps flight robust).
+        # DEFAULT ON (open-vocab detects doorway/wall/window/etc. that COCO lacks + the goal-layer needs);
+        # set YOLO_WORLD=0 to force the lighter COCO yolov8n. Falls back to COCO if CLIP/weights missing.
+        if os.getenv("YOLO_WORLD", "1") == "1":
+            try:
+                from ultralytics import YOLOWorld
+                _wm = os.getenv("YOLO_WORLD_MODEL", "yolov8s-worldv2.pt")
+                _weng = _wm.replace('.pt', '.engine')
+                if os.getenv("YOLO_TRT", "1") == "1" and os.path.exists(_weng):
+                    # TensorRT engine with the WORLD_CLASSES baked in at export (build_trt_world.py)
+                    # — same open-vocab detections, ~2x faster. set_classes not needed (nor possible).
+                    self.model = YOLO(_weng)
+                    print(f"⚡ Detector: YOLO-World TensorRT ({os.path.basename(_weng)}, classes baked)")
+                else:
+                    self.model = YOLOWorld(_wm)
+                    self.model.set_classes(self.WORLD_CLASSES)
+                    print("🔍 Detector: YOLO-World (open-vocabulary, nav-class prompts)")
+                self.is_world = True
+                self.conf = float(os.getenv("YOLO_CONF", "0.12"))   # open-vocab -> lower default conf
+            except Exception as _e:
+                print(f"🔍 YOLO-World unavailable ({_e}) — falling back to {os.path.basename(model_path)}")
+                self.model = YOLO(model_path)
+        else:
+            # Prefer a prebuilt TensorRT engine next to the weights (2.35x faster on this RTX,
+            # built by scratchpad/build_trt.py) — Ultralytics loads .engine transparently.
+            _eng = str(model_path).replace('.pt', '.engine')
+            if os.getenv("YOLO_TRT", "1") == "1" and os.path.exists(_eng):
+                try:
+                    self.model = YOLO(_eng)
+                    print(f"⚡ Detector: TensorRT engine {os.path.basename(_eng)} (FP16, ~2.3x)")
+                except Exception as _te:
+                    print(f"TRT engine load failed ({_te}) — using {os.path.basename(model_path)}")
+                    self.model = YOLO(model_path)
+            else:
+                self.model = YOLO(model_path)
         self.lock = threading.Lock()
         self.frame = None
         self.latest_detections = []
@@ -179,14 +236,94 @@ class ThreadedYOLO:
                     self.frame = None # Consume
             
             if input_frame is not None:
-                # Inference
-                results = self.model(input_frame, verbose=False)
+                # Inference (conf threshold honours YOLO-World's lower default)
+                results = self.model(input_frame, verbose=False, conf=self.conf)
                 new_dets = results[0].boxes
-                
+
                 with self.lock:
                     self.latest_detections = new_dets
             else:
                 time.sleep(0.01)
+
+
+class ThreadedDepth:
+    """
+    Always-on monocular depth on a dedicated GPU thread.
+
+    Runs Depth Anything V2 continuously on the freshest frame so obstacle
+    avoidance ALWAYS has a current depth map — without ever blocking the
+    main video loop (the synchronous ~150-790ms estimate() was the loop killer
+    AND the reason the GPU sat idle: nothing was hammering it every frame).
+    """
+    def __init__(self, estimator):
+        self.estimator = estimator
+        self.frame = None
+        self.depth_map = None
+        self.metric_map = None        # real-metres map (float32 [H,W]) when a metric model is loaded
+        self.subject_mask = None
+        self.infer_ms = 0.0
+        self.lock = threading.Lock()
+        self.running = True
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread.start()
+
+    def update(self, frame):
+        if frame is not None:
+            with self.lock:
+                self.frame = frame  # estimate() copies internally; no copy needed here
+
+    def get_latest(self):
+        with self.lock:
+            return self.depth_map, self.subject_mask
+
+    def get_metric(self):
+        """Latest depth in real METRES (float32 [H,W]), or None if the model is relative-only."""
+        with self.lock:
+            return self.metric_map
+
+    def stop(self):
+        self.running = False
+
+    def _worker(self):
+        while self.running:
+            f = None
+            with self.lock:
+                if self.frame is not None:
+                    f = self.frame
+                    self.frame = None
+            if f is not None:
+                try:
+                    t0 = time.time()
+                    dm, mask = self.estimator.estimate(f)
+                    mm = None
+                    try:
+                        mm = self.estimator.get_last_metric_depth()   # real metres (None if relative model)
+                    except Exception:
+                        mm = None
+                    with self.lock:
+                        self.depth_map = dm
+                        self.metric_map = mm
+                        self.subject_mask = mask
+                        self.infer_ms = (time.time() - t0) * 1000.0
+                except Exception:
+                    pass
+            else:
+                time.sleep(0.003)
+
+
+# === DRONE SENSOR/CAMERA MOUNTING GEOMETRY (metres, drone body frame) ===
+# Body frame: +x = right, +y = forward, +z = up. Origin = drone centre.
+# LiDAR sits ABOVE the drone, horizontal -> sees a 360° slice at +z, blind below it.
+# Camera sits BELOW the drone, looking forward (slightly down) -> fills the lidar's
+# lower blind spot. Fusing them = full vertical coverage. Tune these to your build.
+MOUNT = {
+    'lidar_z':      0.08,    # lidar 8 cm above centre
+    'cam_z':       -0.06,    # camera 6 cm below centre
+    'cam_forward':  0.04,    # camera 4 cm forward of centre
+    'cam_pitch_deg': 10.0,   # camera tilted 10° down from horizontal
+    'cam_hfov_deg':  86.0,   # GoPro HERO12 linear HFOV (~86° at the res used)
+}
+
 
 class DirectorCore:
     def __init__(self, simulation_only=False):
@@ -225,10 +362,14 @@ class DirectorCore:
         self.remote_obstacles = [] # From Lidar (comes via websocket)
         self.lidar = YDLidarDriver() if YDLidarDriver else None # Optionally local if sensor attached
         
-        # RTH & Land Behavior (Configurable by User via App)
-        self.rth_behavior = "user" # or "home"
+        # RTH & Land Behavior (Configurable by User via App — SET_CONFIG)
+        self.rth_behavior = "user" # or "home" or "land"  (WHERE the AI returns to)
         self.land_behavior = "here" # or "home"
         self.last_known_user_loc = None # [lat, lon], updated by packet handler
+        # AUTO-RETURN: the AI returns when battery hits the USER'S app-set threshold, to the USER'S
+        # app-set destination (rth_behavior). No hardcoded % — the app owns both.
+        self.return_battery_pct = int(os.getenv("RETURN_BATTERY_PCT", "20"))
+        self._auto_return_done = False   # one-shot latch (reset when battery recovers, e.g. pack swap)
         
         # AI STATE VARS
         self.current_action = "hover"
@@ -239,7 +380,11 @@ class DirectorCore:
         # Flags
         self.processing = False
         self.is_recording = False
-        
+        # BEAUTIFY is OFF during flight: the AI plans+captures the shot live (flight+gimbal), footage
+        # is recorded RAW, and color-grading/SuperRes/HDR happens LATER as a separate post-process on
+        # the saved video — so the GPU stays focused on the pilot. Toggle with CINEMATIC_RENDER=1.
+        self._cinematic_render = (os.getenv("CINEMATIC_RENDER", "0") == "1")
+
         # === ENABLE TRUE AUTONOMOUS MODE ===
         # AI will think and make decisions like a human film crew
         # === ENABLE TRUE AUTONOMOUS MODE ===
@@ -270,7 +415,8 @@ class DirectorCore:
         
         # COMPLETE WIRING (Items 21-60)
         self.motion_engine = MotionEngine()
-        self.mavlink_exec = MavlinkExecutor()
+        # (removed dead self.mavlink_exec = MavlinkExecutor() — it was never called and its
+        #  internal .send_message path was a no-op; all FC commands go via self.ws → the bridge.)
         self.render_master = RenderMaster()
         self.metadata = ShotMetadata()
         self.shot_planner = ShotPlanner()
@@ -331,11 +477,14 @@ class DirectorCore:
             self.superres = AISuperRes()
             self.depth_estimator = AIDepthEstimator()
             self.lensfix = AILensFix()
-            print("✅ Image Enhancement: Deblur, HDR, NoiseReduc, SuperRes, Depth, LensFix")
+            # Always-on depth on its own GPU thread (obstacle avoidance needs it every frame)
+            self.threaded_depth = ThreadedDepth(self.depth_estimator)
+            print("✅ Image Enhancement: Deblur, HDR, NoiseReduc, SuperRes, Depth(threaded), LensFix")
         except ImportError as e:
             print(f"⚠️ Enhancement modules: {e}")
             self.deblur = self.hdr_engine = self.noise_reduction = None
             self.super_resolution = self.superres = self.depth_estimator = self.lensfix = None
+            self.threaded_depth = None
         
         # Motion & Stabilization Modules
         try:
@@ -464,8 +613,8 @@ class DirectorCore:
         
         try:
            self.gemini = GeminiDirector(api_key=os.getenv("GEMINI_API_KEY"))
-        except:
-           self.autopilot = MavlinkExecutor()
+        except Exception:
+           self.gemini = None  # keep self.autopilot as AutopilotController (it has .connect)
 
         # TWO-BRAIN ARCHITECTURE (configured by gpu_config):
         # Standard mode: Qwen 2.5 VL 3B (256px, 28fps) + Gemini 2.0 Flash
@@ -482,14 +631,57 @@ class DirectorCore:
         print(f"🧠 Gemini Brain: {self.gemini_brain.model} (cloud, every {gemini_cfg.get('interval_seconds', 2)}s)")
         
         self._brain_override = True  # ER Brain takes precedence on navigation
+        # AUTONOMOUS AI FLIGHT: Qwen (ER brain) + Pi0 + sensor fusion run continuously and fly
+        # the drone. A discrete user command (process_job → _execute_relative_path) takes the
+        # motors for its short duration via _command_until; outside that window Qwen is the pilot.
+        self._command_until = 0.0
+        self._airborne = False   # True only after _arm_and_takeoff lifts off; gates Qwen driving
+        # CONTINUOUS MISSION: Gemini gives ONE strategic intent; Qwen + Pi0 + YOLO + depth then fly
+        # it closed-loop with live sensors until stopped. _mission_active keeps the intent FRESH so
+        # Qwen keeps pursuing it (a 'stale' intent makes the 3B model hover). Cleared on stop/disarm.
+        self._mission_active = False
+        self._mission_text = ""
+        self._mission_id = 0      # bumped per mission so a new command supersedes the old loop
+
+        # GEMINI CONTINUOUS-LOOP SWITCH: the on-demand ~2s Gemini director loop (block 4b below)
+        # burns the free-tier quota fast. During TESTING keep it OFF — Gemini still plans ONCE per
+        # command (the comprehensive ask_gpt plan), then Qwen flies that intent continuously on its
+        # own. Flip ON later for full AI-guided flight. Default OFF; override with env
+        # GEMINI_CONTINUOUS_LOOP=1, or toggle live via app command GEMINI_LOOP_ON / GEMINI_LOOP_OFF.
+        self._gemini_loop_enabled = (os.getenv("GEMINI_CONTINUOUS_LOOP", "0") == "1")
+        print(f"🛰️ Gemini 2s loop: {'ON' if self._gemini_loop_enabled else 'OFF (one-shot plan only — quota-safe)'}")
+
+        # LOCAL PATH PLANNER (opt-in, NAV_PLANNER=1): a drone-centred costmap + A* that makes the
+        # ROUTE code-owned — the pilot picks the DIRECTION, the planner routes AROUND the live fused
+        # obstacles toward it (answers Part B: a wrong-direction tick can't derail the flight).
+        # Default OFF = the pilot's velocity is used directly (current reactive behaviour, zero change).
+        # ⚠️ The MODULE/algorithm is unit-verified (routes around obstacles, 0 collisions) but the LIVE
+        # wiring's frame conventions + speed/cell tuning still need on-drone validation.
+        self.nav_planner = None
+        if os.getenv("NAV_PLANNER", "0") == "1":
+            try:
+                from laptop_ai.nav_costmap import LocalCostmap
+                self.nav_planner = LocalCostmap(size_m=6.0, res_m=0.15, drone_radius_m=0.25)
+                print("🗺️ Local path planner: ON (NAV_PLANNER=1) — route is planner-owned")
+            except Exception as _e:
+                print(f"🗺️ Local path planner: failed to load ({_e}) — using reactive avoidance")
 
         # SPATIAL AWARENESS GRID — fuses LiDAR + ToF + MiDaS into 2.5D obstacle map
         try:
             from laptop_ai.spatial_grid import SpatialGrid
             self.spatial_grid = SpatialGrid()
+            try:
+                from laptop_ai.depth_anchor import DepthScaleAnchor
+                self.depth_anchor = DepthScaleAnchor(hfov_deg=MOUNT.get('cam_hfov_deg', 86.0))
+                print("📐 Motion-triangulation depth anchor ONLINE (cm-class scale from parallax)")
+            except Exception as _e:
+                self.depth_anchor = None
+                print(f"depth_anchor unavailable: {_e}")
             print("Spatial Grid: ACTIVE (10x10m, sensor fusion)")
         except ImportError:
             self.spatial_grid = None
+        self._spatial_map_img = None
+        self._spatial_thread_started = False
 
         print(f"Advanced AI Models Instantiated (Pi0: {self.pi0_pilot.model_type}, DS: {self.deepstream.mode}, Brain: ONLINE)")
 
@@ -521,6 +713,12 @@ class DirectorCore:
         # Without this, laptop AI NEVER receives sensor data from drone
         if hasattr(self, 'ws') and self.ws:
             self.ws.add_recv_handler(self._handle_packet)
+            # FIX: open the :8000 socket NOW (don't wait for a lazy ws.send()).
+            # connect() only fired on the first send() — a vision-driven gimbal/track command.
+            # With GoPro OFF there are no such commands → connect() never ran → recv loop never
+            # started → NO LiDAR/telemetry reached the spatial map. Connect explicitly + let the
+            # MessagingClient watchdog keep it alive regardless of camera state.
+            asyncio.create_task(self.ws.connect())
             print("✅ Packet handler registered — will receive ESP32 telem + LiDAR scans")
         print("✅ Director Loops Active.")
         
@@ -531,6 +729,21 @@ class DirectorCore:
         # Start Gemini Continuous Mastermind
         if hasattr(self, 'gemini_brain'):
             self.gemini_brain.connect()
+
+    def _start_spatial_render_thread(self):
+        """Render the heavy (~790ms) spatial map off the main loop so video stays at full fps."""
+        import threading
+        self._spatial_thread_started = True
+        def _worker():
+            while True:
+                try:
+                    if self.spatial_grid:
+                        self._spatial_map_img = self.spatial_grid.render_map()
+                except Exception:
+                    pass
+                time.sleep(0.05)  # renders ~as fast as it can (~1-2fps); never blocks the video loop
+        threading.Thread(target=_worker, daemon=True).start()
+        print("🗺️ Spatial map render moved to background thread (video loop unblocked)")
 
     def _load_cinematic_library(self):
         """
@@ -631,8 +844,8 @@ class DirectorCore:
         # Path 2 (RENDER): Cloud server MJPEG relay (200ms+, 480p JPEG fallback)
 
         # 1. Tailscale UDP stream from Radxa (primary — fast, works across any network)
-        RADXA_TAILSCALE_IP = "100.94.242.14"
-        internal_src = f"udp://@0.0.0.0:8554"  # Radxa sends TO us on this port via Tailscale
+        RADXA_TAILSCALE_IP = os.getenv("CUBIE_TS_IP", "100.89.83.125")
+        internal_src = f"rtsp://{RADXA_TAILSCALE_IP}:8554/gopro"  # MediaMTX clean H264 (low-latency RTSP)
 
         # 2. Cloud relay fallback (if Tailscale is down)
         gopro_src = RTSP_URL  # Render server MJPEG relay of Radxa frames
@@ -658,16 +871,19 @@ class DirectorCore:
         except Exception as e:
             print(f"   ❌ Tailscale Stream Error: {e}")
 
-        # Try Render Cloud Relay (fallback — higher latency but always works)
-        try:
-            print(f"   👉 Connecting Cloud Relay (fallback): {gopro_src}...")
-            self.cam_gopro = CameraStream(src=gopro_src, width=CAM_WIDTH, height=CAM_HEIGHT).start()
-            if self.cam_gopro.working:
-                print(f"   ✅ CLOUD RELAY CONNECTED (Render MJPEG)")
-            else:
-                 print(f"   ⚠️ CLOUD RELAY NOT AVAILABLE.")
-        except Exception as e:
-             print(f"   ❌ Cloud Relay connection failed: {e}")
+        # Try Render Cloud Relay (fallback) — SKIP if it's the SAME stream as internal (double-decode = lag + low fps)
+        if gopro_src and gopro_src != internal_src:
+            try:
+                print(f"   👉 Connecting Cloud Relay (fallback): {gopro_src}...")
+                self.cam_gopro = CameraStream(src=gopro_src, width=CAM_WIDTH, height=CAM_HEIGHT).start()
+                if self.cam_gopro.working:
+                    print(f"   ✅ CLOUD RELAY CONNECTED (Render MJPEG)")
+                else:
+                     print(f"   ⚠️ CLOUD RELAY NOT AVAILABLE.")
+            except Exception as e:
+                 print(f"   ❌ Cloud Relay connection failed: {e}")
+        else:
+            print("   ⏭️ Skipping 2nd camera (same URL as internal — avoids double-decode lag)")
 
         if (not self.cam_internal or not self.cam_internal.working) and \
            (not self.cam_gopro or not self.cam_gopro.working):
@@ -712,7 +928,8 @@ class DirectorCore:
             raw_frame = self.fusion.get_active_frame()
             current_source = self.fusion.select_best_source() # "internal" or "gopro"
             
-            # Handle "No Signal"
+            # Handle "No Signal" — BLIND MODE (camera/GoPro down). Lidar + ESP still fly the drone.
+            self._blind = (raw_frame is None)
             if raw_frame is None:
                 # No Camera -> Show Disconnected Screen
                 blank_frame.fill(0)
@@ -779,53 +996,113 @@ class DirectorCore:
                 ds_fps = self.deepstream.get_fps() if hasattr(self, 'deepstream') and self.deepstream else 0
                 print(f"🔥 GPU INFERENCE RUNNING: {len(detections)} objects | Device: {dev_name} | Source: {current_source.upper()} | Detector: {det_source} | DS FPS: {ds_fps:.0f}")
 
-            # 3b. DEPTH ESTIMATION (MiDaS) — every 5 frames (~6 FPS)
-            # Gives all AIs actual depth perception from the camera
+            # 3b. DEPTH — ALWAYS ON (threaded GPU). Feeds obstacle avoidance every frame.
+            # The estimate() runs continuously on its own GPU thread; here we just push the
+            # latest frame to it and read back the freshest map (non-blocking).
             depth_map = None
-            subject_depth = 9.9  # default: far away
-            if hasattr(self, 'depth_estimator') and self.depth_estimator and frame_id % 5 == 0:
+            self._camera_obstacle_points = []   # (x_right, y_fwd) in drone body frame, forward = -y
+            # Skip monocular depth when BLIND — a black blank frame yields garbage depth (~5.7m)
+            # that would pollute the obstacle map. Lidar/ESP remain the obstacle source.
+            if hasattr(self, 'threaded_depth') and self.threaded_depth and not getattr(self, '_blind', False):
+                self.threaded_depth.update(raw_frame)
+                depth_map, _ = self.threaded_depth.get_latest()
+            if depth_map is None:
+                self._subject_depth_m = 99.0    # no valid camera depth -> "far" so lidar wins
+            if depth_map is not None:
                 try:
-                    depth_map, subject_mask = self.depth_estimator.estimate(raw_frame)
-                    if depth_map is not None:
-                        # Get depth at image center (where tracked subject usually is)
-                        h_d, w_d = depth_map.shape[:2]
-                        center_depth = float(depth_map[h_d//2, w_d//2])
+                    # REAL METRES if a metric depth model is loaded (Depth-Anything-V2-Metric-Indoor);
+                    # else fall back to the old relative-0..1 -> approx-metres hack (unchanged behaviour).
+                    metric_map = self.threaded_depth.get_metric() if hasattr(self, 'threaded_depth') else None
+                    use_metric = metric_map is not None and metric_map.shape[:2] == depth_map.shape[:2]
+                    h_d, w_d = depth_map.shape[:2]
+                    NEAR_M, FAR_M = 0.25, 6.0
+                    rel2m = lambda v: NEAR_M + (1.0 - float(v)) * (FAR_M - NEAR_M)
 
-                        # If we have a tracked subject, get depth at its centroid
-                        if detections:
-                            try:
-                                det = detections[0]
-                                if hasattr(det, 'xyxy'):
-                                    cx = int((det.xyxy[0][0] + det.xyxy[0][2]) / 2)
-                                    cy = int((det.xyxy[0][1] + det.xyxy[0][3]) / 2)
-                                elif isinstance(det, (list, tuple)) and len(det) >= 4:
-                                    cx, cy = int(det[1]), int(det[2])
-                                else:
-                                    cx, cy = w_d // 2, h_d // 2
-                                # Scale to depth map coords
-                                dx = max(0, min(w_d - 1, int(cx * w_d / w)))
-                                dy = max(0, min(h_d - 1, int(cy * h_d / h)))
-                                subject_depth = float(depth_map[dy, dx])
-                            except:
-                                subject_depth = center_depth
-                        else:
-                            subject_depth = center_depth
+                    # Subject depth (centre, or tracked box centroid) for the AIs
+                    cx, cy = w_d // 2, h_d // 2
+                    if detections:
+                        try:
+                            det = detections[0]
+                            if hasattr(det, 'xyxy'):
+                                bx = det.xyxy[0]
+                                cx = int((float(bx[0]) + float(bx[2])) / 2 * w_d / w)
+                                cy = int((float(bx[1]) + float(bx[3])) / 2 * h_d / h)
+                            elif isinstance(det, (list, tuple)) and len(det) >= 4:
+                                cx = int(det[1] * w_d / w); cy = int(det[2] * h_d / h)
+                        except Exception:
+                            pass
+                    cx = max(0, min(w_d - 1, cx)); cy = max(0, min(h_d - 1, cy))
+                    if use_metric:
+                        self._subject_depth_m = min(float(metric_map[cy, cx]), 30.0)   # real metres
+                    else:
+                        self._subject_depth_m = min(rel2m(depth_map[cy, cx]), 30.0)
 
-                        # Convert normalized depth (0-1, 1=close) to approximate meters
-                        # MiDaS gives relative depth — scale using ToF front as reference
-                        tof_front_m = env.get('tof_front', 3000) / 1000.0 if hasattr(self, 'current_environment_state') else 5.0
-                        if subject_depth > 0.01:
-                            subject_depth_m = tof_front_m * (1.0 / max(subject_depth, 0.05))
-                        else:
-                            subject_depth_m = 9.9
-                        subject_depth_m = min(subject_depth_m, 30.0)  # Cap at 30m
-
-                        # Store for other modules
-                        self._latest_depth_map = depth_map
-                        self._subject_depth_m = subject_depth_m
+                    # --- FUSE CAMERA DEPTH INTO THE GRID across the FOV ---
+                    # Each column -> a bearing; col_m[ix] = CLOSEST surface in that column, in METRES.
+                    # Metric: a HORIZON band (0.30-0.62) excludes the floor (a lower band makes the
+                    # ground dominate); closest surface = min of the metres map. Relative fallback keeps
+                    # the old band/logic exactly. NOTE the body-frame projection still assumes the MOUNT
+                    # geometry (cam pitch/fwd) — field-calibrate that on the real drone.
+                    hfov = math.radians(MOUNT['cam_hfov_deg'])
+                    if use_metric:
+                        band = metric_map[int(h_d * 0.30):int(h_d * 0.62), :]
+                        col_m = band.min(axis=0)                            # closest surface per column (metres)
+                    else:
+                        band = depth_map[int(h_d * 0.40):int(h_d * 0.75), :]  # mid/lower rows = ground & near obstacles
+                        col_rel = band.min(axis=0)
+                        col_m = np.array([rel2m(v) for v in col_rel], dtype=np.float32)
+                    N = 48
+                    step = max(1, w_d // N)
+                    closest_front = 99.0
+                    # GIMBAL-AWARE FUSION: the camera rides the gimbal, so every depth bearing is
+                    # offset by the gimbal PAN — otherwise a panned camera writes obstacles into the
+                    # WRONG body-frame sector and 'front clearance' reads wherever the lens points.
+                    # A steeply tilted camera (>35 deg) sees floor/ceiling, not horizontal obstacles
+                    # -> skip fusing those frames (the band geometry no longer holds).
+                    _gp = math.radians(float(getattr(self, '_gimbal_yaw_deg', 0.0)))
+                    _gt = abs(float(getattr(self, '_gimbal_pitch_deg', 0.0)))
+                    for ix in range(0, w_d, step):
+                        if _gt > 35.0:
+                            break
+                        m = float(col_m[ix])
+                        if m >= FAR_M - 0.05:
+                            continue
+                        bearing = (ix / w_d - 0.5) * hfov + _gp    # +right, incl. gimbal pan
+                        fwd = m * math.cos(bearing) + MOUNT['cam_forward']
+                        lat = m * math.sin(bearing)
+                        # body frame, forward = -y (matches ToF/grid convention)
+                        self._camera_obstacle_points.append((lat, -fwd))
+                        if abs(bearing) < math.radians(20):        # straight-ahead cone (body frame)
+                            closest_front = min(closest_front, fwd)
+                    self._front_obstacle_m = closest_front
+                    # === MOTION-TRIANGULATION SCALE ANCHOR (cm-class truth from parallax) ===
+                    # Track features between frames; the drone's own motion is the stereo baseline.
+                    # Corrects the dense metric map's scale live — the OLD anchor needed the (dead)
+                    # ESP front-ToF, so this is the first LIVE scale source on real hardware.
+                    if getattr(self, 'depth_anchor', None) is not None and use_metric and raw_frame is not None:
+                        try:
+                            _t2 = time.time()
+                            _tel2 = self.autopilot.get_telemetry() or {}
+                            _pt = getattr(self, '_anch_prev_t', None)
+                            _dtA = min(0.5, _t2 - _pt) if _pt else 0.0
+                            _lv = getattr(self.autopilot, '_last_vel', None) or (0, 0, 0, 0)
+                            _tb = (_lv[0]*_dtA, _lv[1]*_dtA, -_lv[2]*_dtA)   # fwd,right,up (cmd NED vz->up)
+                            _pa = getattr(self, '_anch_prev_att', None) or {}
+                            _da = ((_tel2.get('roll') or 0) - (_pa.get('roll') or 0),
+                                   (_tel2.get('pitch') or 0) - (_pa.get('pitch') or 0),
+                                   (_tel2.get('yaw') or 0) - (_pa.get('yaw') or 0))
+                            _gray = cv2.cvtColor(cv2.resize(raw_frame, (metric_map.shape[1], metric_map.shape[0])),
+                                                 cv2.COLOR_BGR2GRAY)
+                            self.depth_anchor.update(_gray, metric_map, _tb, _da)
+                            self._anch_prev_t = _t2
+                            self._anch_prev_att = {k: _tel2.get(k) for k in ('roll', 'pitch', 'yaw')}
+                        except Exception:
+                            pass
+                    self._latest_depth_map = depth_map
+                    self._depth_infer_ms = getattr(self.threaded_depth, 'infer_ms', 0)
                 except Exception as e:
                     if frame_id % 150 == 0:
-                        print(f"Depth estimation: {e}")
+                        print(f"Depth fuse: {e}")
 
             # Make depth available to environment state
             if not hasattr(self, '_subject_depth_m'):
@@ -849,6 +1126,7 @@ class DirectorCore:
                     lidar_points=getattr(self, 'remote_obstacles', None),
                     tof_sensors=tof if tof else None,
                     depth_info={'subject_depth_m': getattr(self, '_subject_depth_m', 9.9)},
+                    camera_points=getattr(self, '_camera_obstacle_points', None),
                     altitude=env.get('altitude', 0),
                     drone_yaw_rad=env.get('yaw', 0),
                 )
@@ -885,10 +1163,27 @@ class DirectorCore:
                     'vx': env.get('speed', 0),
                     'vy': 0,
                     'x': 0, 'y': 0,
-                    'depth_dist': getattr(self, '_subject_depth_m', env.get('tof_front', 9999) / 1000.0),
+                    # Closest thing straight ahead. LIDAR/ToF (spatial grid) is the source of truth —
+                    # it correctly catches see-through obstacles (nets/gates) that fool monocular depth.
+                    # Camera depth only used as a fallback when the lidar's forward cone is clear.
+                    'depth_dist': min(
+                        (self.spatial_grid.get_front_obstacle_m() if getattr(self, 'spatial_grid', None) else 99.0),
+                        getattr(self, '_front_obstacle_m', 99.0),
+                        getattr(self, '_subject_depth_m', 99.0),
+                    ),
                     'altitude': env.get('altitude', 0),
                     'heading': env.get('heading', 0),
                 }
+                # Self-calibrate stopping distance from live flight performance before deciding.
+                try:
+                    self.pi0_pilot.calibrate({
+                        'vx': env.get('speed', 0), 'vy': 0,
+                        'hover_throttle': env.get('hover_throttle', env.get('thr_hover')),
+                        # FC's REAL max lean (centideg -> deg) so the PD clamp matches the airframe.
+                        'max_lean_deg': ((self.autopilot.get_telemetry() or {}).get('fc_caps') or {}).get('ANGLE_MAX', 4500) / 100.0,
+                    })
+                except Exception:
+                    pass
                 pi0_commands = self.pi0_pilot.update(pi0_state)
                 self._pi0_commands = pi0_commands
                 
@@ -897,7 +1192,8 @@ class DirectorCore:
                 # that get ADDED to ER brain's velocity commands for stability
                 if self._pi0_active and pi0_commands and hasattr(self, 'autopilot'):
                     if pi0_commands.get('emergency'):
-                        # Emergency brake — immediate stop (Pi0 detected danger at 50Hz)
+                        # Emergency brake — last-resort hard stop (Pi0 detected imminent danger
+                        # at 50Hz). Genuine-danger only; the reactive avoidance handles the rest.
                         self.autopilot.send_velocity(0, 0, 0)
                         print("🛑 Pi0 EMERGENCY BRAKE")
                     else:
@@ -910,58 +1206,202 @@ class DirectorCore:
                         }
 
             # 4a. LOCAL ER BRAIN (QWEN2.5-VL) — Continuous fast spatial decisions
-            if hasattr(self, 'er_brain') and self.er_brain and self.er_brain.connected:
-                # Feed frame + sensor data to local ER
+            if getattr(self, '_ai_active', False) and hasattr(self, 'er_brain') and self.er_brain and self.er_brain.connected:
+                # Feed frame + sensor data to local ER (ON-DEMAND: only after an AI-box message)
                 sensor_state = getattr(self, 'current_environment_state', {})
+                # 🔧 AUDIT FIX (2026-07-06): the ESP ToF sensors are DEAD (PCA9548A) so tof_*/t1-t4
+                # defaulted to 9999 -> the pilot resolver read "all clear" -> its clearance SPEED-CAP,
+                # DIRECTION-CORRECTION and GOAL-STEER were silently NON-FUNCTIONAL on hardware (real safety
+                # only came from the separate _enforce_clearance/_reactive_avoidance). Feed the resolver the
+                # REAL FUSED clearances from the spatial grid (LiDAR + metric-depth camera), in cm, so those
+                # safeguards actually work. Convention: t1=front, t2=right, t3=back, t4=left.
+                _sg = getattr(self, 'spatial_grid', None)
+                _summ = (getattr(_sg, '_obstacle_summary', {}) or {}) if _sg else {}
+                if _summ:
+                    def _cl(*keys):
+                        vals = [_summ[k] for k in keys if _summ.get(k) is not None]
+                        return int(min(vals)) if vals else None
+                    _f = _cl('front', 'front_left', 'front_right'); _l = _cl('left', 'front_left')
+                    _r = _cl('right', 'front_right');               _b = _cl('back', 'back_left', 'back_right')
+                    for _k, _v in (('tof_front', _f), ('tof_left', _l), ('tof_right', _r), ('tof_back', _b),
+                                   ('t1', _f), ('t2', _r), ('t3', _b), ('t4', _l)):
+                        if _v is not None:
+                            sensor_state[_k] = _v
                 det_list = []
+                # Per-object METRIC distance + readable LABEL for the PILOT (same fusion Gemini gets).
+                _dm = getattr(self, '_latest_depth_map', None)
+                _fh, _fw = (raw_frame.shape[:2] if raw_frame is not None else (1, 1))
+                _r2m = lambda v: 0.25 + (1.0 - float(v)) * (6.0 - 0.25)
+                _scale = self._fused_depth_scale()                            # triangulation-first anchor
+                # Use the ACTUAL detector's class names (COCO for yolov8n, the prompts for YOLO-World).
+                # AUDIT FIX: was reading self.classifier.names (a SceneClassifier) -> wrong labels, which
+                # broke the goal-layer class match + object labels.
+                _names = None
+                _ty = getattr(self, 'threaded_yolo', None)
+                if _ty is not None and getattr(_ty, 'model', None) is not None:
+                    _names = getattr(_ty.model, 'names', None)
+                if not _names:
+                    _names = getattr(getattr(self, 'classifier', None), 'names', None)
                 for d in (detections[:5] if detections else []):
                     try:
                         if isinstance(d, (list, tuple)):
                             det_list.append({"class": str(d[0]), "confidence": float(d[-1]) if len(d) > 5 else 0.5})
                         elif hasattr(d, 'cls'):
-                            det_list.append({"class": str(int(d.cls[0])), "confidence": float(d.conf[0])})
+                            _cid = int(d.cls[0])
+                            _lbl = _names.get(_cid, str(_cid)) if isinstance(_names, dict) else str(_cid)
+                            _o = {"class": _lbl, "confidence": float(d.conf[0])}
+                            if _dm is not None and hasattr(d, 'xyxy'):
+                                bx = d.xyxy[0]
+                                _cxp = min(max((float(bx[0]) + float(bx[2])) / 2 / _fw, 0.0), 1.0)
+                                _cyp = min(max((float(bx[1]) + float(bx[3])) / 2 / _fh, 0.0), 1.0)
+                                _hd, _wd = _dm.shape[:2]
+                                _o["distance_m"] = round(min(_r2m(_dm[int(_cyp * (_hd - 1)), int(_cxp * (_wd - 1))]) * _scale, 30.0), 2)
+                                _o["bearing"] = "front-left" if _cxp < 0.38 else ("front-right" if _cxp > 0.62 else "center")
+                            if hasattr(d, 'xyxy'):
+                                _bb = d.xyxy[0]
+                                _o["box"] = [int(_bb[0]), int(_bb[1]), int(_bb[2]), int(_bb[3])]  # for the fused overlay
+                            det_list.append(_o)
                     except:
                         pass
-                self.er_brain.update_state(raw_frame, sensor_state, det_list)
+                # === MISSION GOAL LAYER: turn 'search/explore' into GOAL-DIRECTED approach+track. If the
+                #     director's mission names a target that is now DETECTED, give the pilot its LIVE bearing
+                #     (deg) + distance as the SUBJECT — so it heads toward it and frames it (yaw face_subject),
+                #     and the code goal-steer (below, in the pilot exec) biases the route toward it. ===
+                self._mission_target = None
+                _intent = (getattr(self, 'current_director_intent', '') or
+                           getattr(getattr(self, 'gemini_brain', None), 'mission', '') or '').lower()
+                if _intent and det_list:
+                    _hfov = MOUNT.get('cam_hfov_deg', 86.0); _best = None
+                    # synonyms so a COCO label ('couch','tv') matches a natural mission ('sofa','television')
+                    _SYN = {"sofa": "couch", "couch": "sofa", "tv": "television", "television": "tv",
+                            "plant": "potted plant", "potted plant": "plant", "fridge": "refrigerator",
+                            "refrigerator": "fridge"}
+                    for _o in det_list:
+                        _cls = str(_o.get('class', '')).lower(); _bb = _o.get('box')
+                        if _cls and _bb and (_cls in _intent or _SYN.get(_cls, '\0') in _intent):
+                            _cx = ((_bb[0] + _bb[2]) / 2.0) / max(1, _fw)
+                            _area = (_bb[2] - _bb[0]) * (_bb[3] - _bb[1])   # biggest instance = closest
+                            if _best is None or _area > _best[0]:
+                                _best = (_area, _cls, round((_cx - 0.5) * _hfov, 1), _o.get('distance_m'))
+                    if _best:
+                        _, _tc, _tb, _td = _best
+                        sensor_state['subject_bearing_deg'] = _tb           # face_subject yaw tracks it
+                        sensor_state['mission_target'] = {"class": _tc, "bearing_deg": _tb, "distance_m": _td}
+                        self._mission_target = {"class": _tc, "bearing_deg": _tb, "distance_m": _td}
+
+                # FUSED CONTINUOUS-VIDEO INPUT: overlay the sensor feed (object boxes+distances, ToF,
+                # depth inset, 360° LiDAR map, nearest-obstacle) ONTO the frame, and feed Qwen a ROLLING
+                # BUFFER of these frames = a live video stream with motion + spatially-grounded sensors,
+                # NOT a disconnected still + text. The pilot sees what the app sees, plus the sensor fusion.
+                fused = self._build_fused_ai_frame(raw_frame, det_list, sensor_state)
+                if fused is not None:
+                    if not hasattr(self, '_ai_video_buf') or self._ai_video_buf is None:
+                        self._ai_video_buf = []
+                    self._ai_video_buf.append(fused)
+                    if len(self._ai_video_buf) > 12:          # ~0.5-1s of recent frames
+                        del self._ai_video_buf[0]
+                    self.er_brain.update_state(list(self._ai_video_buf), sensor_state, det_list)
                 
                 # Consume latest brain decision (if available)
                 # Qwen runs at 20-30 FPS now — check every frame
-                if self._brain_override:
+                if getattr(self, '_hybrid_seq', None) is not None:
+                    # HYBRID PILOT active: the deterministic sequencer + resolve_intent + local_avoid
+                    # fly the structured plan PRECISELY every frame (the reliable path — the 3B can't
+                    # emit correct velocities). Qwen's role here is SEMANTIC only (target grounding via
+                    # _inject_semantic_target). This replaces the raw-Qwen-velocity path below.
+                    self._hybrid_tick()
+                elif self._brain_override:
                     decision = self.er_brain.get_latest_decision()
                     if decision and hasattr(self, 'autopilot'):
                         flight = decision.get('flight', {})
-                        
-                        # SAFETY: ER obstacle alert
-                        if decision.get('obstacle_alert'):
-                            print(f"🚨 ER OBSTACLE AVOIDANCE: {decision.get('reasoning', '')[:80]}")
-                            self.autopilot.send_velocity(0, 0, 0)
-                        elif flight.get('hover') or flight.get('stop'):
-                            self.autopilot.send_velocity(0, 0, 0)
-                        else:
-                            # ER controls velocity via local VLM inference
-                            vx = float(flight.get('vx', 0))
-                            vy = float(flight.get('vy', 0))
-                            vz = float(flight.get('vz', 0))
-                            yaw = float(flight.get('yaw_rate', 0))
-                            # ADD Pi0 micro-corrections for stability (wind, vibration)
-                            pi0_corr = getattr(self, '_pi0_correction', {})
-                            vx += pi0_corr.get('vx', 0)
-                            vy += pi0_corr.get('vy', 0)
-                            vz += pi0_corr.get('vz', 0)
-                            self.autopilot.send_velocity(vx, vy, vz, yaw_rate=yaw)
-                        
+
+                        # Qwen is the CONTINUOUS autonomous pilot. obstacle_alert is informational
+                        # (logged), NOT a freeze — the reactive avoidance below redirects/dodges.
+                        if decision.get('obstacle_alert') and frame_id % 30 == 0:
+                            print(f"👁️ ER obstacle watch: {decision.get('reasoning', '')[:80]}")
+
+                        # A disarmed drone is on the ground — keep _airborne honest.
+                        if not int(self.autopilot.get_telemetry().get('armed', 0) or 0):
+                            self._airborne = False
+
+                        # Qwen drives ONLY when AIRBORNE and no discrete command is running.
+                        #  • GROUNDED: send NOTHING. The old continuous hover(0,0,0) spam pinned the
+                        #    throttle RC override to neutral, which blocked arming and kept it grounded.
+                        #    Getting off the ground is _arm_and_takeoff's job (triggered by a command).
+                        #  • COMMAND ACTIVE (_command_until): Qwen yields so they don't fight.
+                        if getattr(self, '_airborne', False) and time.time() >= getattr(self, '_command_until', 0.0):
+                            if flight.get('hover') or flight.get('stop'):
+                                bvx = bvy = bvz = 0.0
+                            else:
+                                bvx = float(flight.get('vx', 0))
+                                bvy = float(flight.get('vy', 0))
+                                bvz = float(flight.get('vz', 0))
+                            byaw = float(flight.get('yaw_rate', 0))
+                            # Pi0 micro-corrections for stability (wind, vibration)
+                            pc = getattr(self, '_pi0_correction', {})
+                            bvx += pc.get('vx', 0); bvy += pc.get('vy', 0); bvz += pc.get('vz', 0)
+                            # OPT-IN LOCAL PATH PLANNER (NAV_PLANNER=1): the pilot picked the DIRECTION
+                            # (bvx,bvy); the planner A*-routes AROUND the live obstacles toward it so a
+                            # wrong-direction tick is corrected by geometry (Part B). Default OFF -> skipped.
+                            # None (boxed/no path) -> keep the pilot velocity, reactive avoidance handles it.
+                            if getattr(self, 'nav_planner', None) is not None and (abs(bvx) + abs(bvy)) > 0.05:
+                                _pv = self._planner_velocity(bvx, bvy)
+                                if _pv is not None:
+                                    bvx, bvy, byaw = _pv[0], _pv[1], _pv[2]
+                            # GOAL-DIRECTED APPROACH (mission completion): if the director's TARGET is in
+                            # view, bias the route toward it (code owns the route to the goal — Part B) so
+                            # the drone actually approaches+frames it, not just wanders. No target -> no-op.
+                            bvx, bvy = self._goal_steer(bvx, bvy)
+                            # AI's ORIGINAL intent magnitude (before any code clamp) — used to detect when
+                            # safety cut the command, so we can tell the pilot (fixation breaker feedback).
+                            _mb = abs(bvx) + abs(bvy) + abs(bvz)
+                            # HARD CLEARANCE CLAMP (zero-wrong guarantee): cap the AI's raw speed to the
+                            # stopping-distance table using ground-truth clearances, BEFORE dynamic dodge.
+                            # A mis-computed AI velocity (e.g. vx0.5 into a 40cm wall) can NEVER execute.
+                            bvx, bvy, bvz, _clamped = self._enforce_clearance(bvx, bvy, bvz)
+                            # Reactive avoidance: caution radius + active dodge (never a blind stop).
+                            # Hover (0,0) still gets pushed off approaching objects = evasion.
+                            svx, svy, svz = self._reactive_avoidance(bvx, bvy, bvz)
+                            # FIXATION BREAKER FEEDBACK: if the clearance clamp OR avoidance cut the pilot's
+                            # command hard, TELL the pilot (it goes into its next prompt) — otherwise the 3B
+                            # keeps re-commanding the exact same blocked move forever (proven failure mode).
+                            _ms = abs(svx) + abs(svy) + abs(svz)
+                            if _mb > 0.05 and _ms < _mb * 0.6:
+                                try:
+                                    self.er_brain.note_blocked(
+                                        f"safety clamped your last command (|v| {_mb:.2f}->{_ms:.2f} m/s): "
+                                        f"obstacle inside caution radius in that direction — pick a "
+                                        f"DIFFERENT direction (largest clearance)")
+                                except Exception:
+                                    pass
+                            # Jerk-limit ONLY (the AI's vx/vy/vz/yaw choice is untouched as a target) so
+                            # the airframe ramps smoothly — no burst, no abrupt change. Hover=0 vel keeps
+                            # motors spinning (never zero-RPM in air).
+                            svx, svy, svz, byaw = self._smooth_cmd(svx, svy, svz, byaw)
+                            # AI WORKS ARDUPILOT'S MODES: a sustained hold -> LOITER (the FC holds position
+                            # & rejects wind via GPS), low battery -> RTL; else GUIDED velocity setpoints
+                            # (the FC follows our wind-rejected command). No-GPS -> no-op (unchanged path).
+                            if not self._manage_flight_mode(svx, svy, svz):
+                                self.autopilot.send_velocity(svx, svy, svz, yaw_rate=byaw)
+
                         # Apply ER gimbal
                         gimbal = decision.get('gimbal', {})
                         if gimbal and hasattr(self.autopilot, 'set_gimbal'):
                             pitch = float(gimbal.get('pitch', 0))
                             yaw_g = float(gimbal.get('yaw', 0))
                             self.autopilot.set_gimbal(pitch, yaw_g)
+                            # remember the camera's pointing so the DEPTH CONE is fused into the
+                            # correct body-frame sector (the camera rides the gimbal!)
+                            self._gimbal_pitch_deg = pitch
+                            self._gimbal_yaw_deg = yaw_g
                         
                         if frame_id % 90 == 0:  # Log status every ~3 seconds
                             print(f"🧠 ER Brain: {decision.get('reasoning', '')[:100]}")
 
-            # 4b. GEMINI CONTINUOUS DIRECTOR (gemini-2.0-flash)
-            if hasattr(self, 'gemini_brain') and self.gemini_brain and self.gemini_brain.connected:
+            # 4b. GEMINI DIRECTOR (gemini-2.0-flash) — continuous ~2s loop. SWITCHED OFF by default
+            # during testing (self._gemini_loop_enabled) so it doesn't burn the free-tier quota; the
+            # one-shot ask_gpt plan + Qwen pilot fully cover testing. Flip ON for AI-guided flight.
+            if self._gemini_loop_enabled and getattr(self, '_ai_active', False) and hasattr(self, 'gemini_brain') and self.gemini_brain and self.gemini_brain.connected:
                 # Feed frame + sensor data to Gemini Director
                 self.gemini_brain.feed(raw_frame, sensor_state, det_list)
                 
@@ -969,10 +1409,13 @@ class DirectorCore:
                 if frame_id % 30 == 0:  # Check occasionally
                     decision = self.gemini_brain.get_latest_decision()
                     if decision and "er_intent" in decision:
-                        # Forward the new 2-second deep plan to the Local ER brain
+                        # Forward the refreshed plan to Qwen in the SAME "DIRECTOR PLAN" framing as the
+                        # one-shot handoff, so Qwen's reasoning is IDENTICAL whether Gemini is one-shot
+                        # (testing) or looping (production). Camera settings are applied separately below
+                        # — they're not flight intent, so they don't pollute Qwen's plan context.
                         if hasattr(self, 'er_brain') and self.er_brain:
                             self.er_brain.set_director_intent(
-                                f"[Gemini 2s Director Plan] {decision['er_intent']} | Basic Cam: {decision.get('basic_camera_settings', {})}"
+                                f"DIRECTOR PLAN (live, refreshed): {decision['er_intent']}"
                             )
 
                         # APPLY CAMERA SETTINGS TO GOPRO (was missing — Gemini outputs them but nobody applied them)
@@ -996,9 +1439,7 @@ class DirectorCore:
                             print(f"🎬 [GEMINI DIRECTOR UPDATE]: {decision.get('reasoning', '')[:100]}")
 
             # RENDER (Handled inline below)
-            
-            if video_out:
-                video_out.write(raw_frame)
+            # (recording happens once later, gated by is_recording — removed the duplicate per-frame write here)
 
             # 4b. SCENE CLASSIFICATION (every 30 frames)
             if frame_id % 30 == 0 and raw_frame is not None:
@@ -1128,7 +1569,7 @@ class DirectorCore:
 
                     if best_box:
                         follow_cmd = self.follower.update(best_box, raw_frame.shape[:2][::-1])
-                        if follow_cmd and self.autopilot.connected:
+                        if follow_cmd and self.autopilot.connected and time.time() >= getattr(self, '_command_until', 0.0):
                             self.autopilot.send_velocity(
                                 follow_cmd.get('vx', 0),
                                 follow_cmd.get('vy', 0),
@@ -1140,23 +1581,37 @@ class DirectorCore:
             if raw_frame is not None:
                 # Apply cinematic processing to EVERY frame (1000+ AI files)
                 # ACES tone curve, color grading, exposure, bloom, grain, stabilization
-                if hasattr(self, 'cam_pipeline') and self.cam_pipeline:
-                    try:
-                        processed = self.cam_pipeline.process(raw_frame)
-                        display_frame = processed if processed is not None else raw_frame.copy()
-                    except Exception:
-                        display_frame = raw_frame.copy()
-                else:
-                    display_frame = raw_frame.copy()
+                # PERF FIX: the full cinematic pipeline (deblur/HDR/color/super-res) per frame was the #1 FPS
+                # killer (~hundreds of ms/frame). It's a final-footage LOOK, not needed for live monitoring or
+                # the AI's perception. Use the raw frame live; apply cinematic grading in post / only on saved clips.
+                display_frame = raw_frame.copy()
                 
                 # Draw detections
                 if self.vision_enabled:
                     for box in detections:
-                        b = box.xyxy[0].cpu().numpy().astype(int)
-                        cv2.rectangle(display_frame, (b[0], b[1]), (b[2], b[3]), (0, 255, 0), 2)
-                        if self.classifier and hasattr(self.classifier, 'names'):
-                            label = f"{self.classifier.names[int(box.cls[0])]} {float(box.conf[0]):.2f}"
-                            cv2.putText(display_frame, label, (b[0], b[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                        try:
+                            b = None
+                            label = None
+                            if hasattr(box, 'xyxy'):                 # ultralytics Box
+                                b = box.xyxy[0].cpu().numpy().astype(int)
+                                if self.classifier and hasattr(self.classifier, 'names'):
+                                    label = f"{self.classifier.names[int(box.cls[0])]} {float(box.conf[0]):.2f}"
+                            elif isinstance(box, dict):              # detector dicts
+                                bb = box.get('bbox') or box.get('xyxy') or box.get('box')
+                                if bb is not None and len(bb) >= 4:
+                                    b = np.array(bb[:4]).astype(int)
+                                cls = box.get('class', box.get('label', box.get('name', '')))
+                                conf = box.get('confidence', box.get('conf', box.get('score')))
+                                if cls != '':
+                                    label = f"{cls}" + (f" {conf:.2f}" if isinstance(conf, (int, float)) else "")
+                            elif isinstance(box, (list, tuple)) and len(box) >= 4:
+                                b = np.array(box[:4]).astype(int)
+                            if b is not None and len(b) >= 4:
+                                cv2.rectangle(display_frame, (int(b[0]), int(b[1])), (int(b[2]), int(b[3])), (0, 255, 0), 2)
+                                if label:
+                                    cv2.putText(display_frame, label, (int(b[0]), int(b[1]) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                        except Exception:
+                            continue
                 
                 # Draw Status OSD
                 fps = 1.0/(time.time()-t0+1e-9)
@@ -1167,15 +1622,20 @@ class DirectorCore:
                 # Show
                 cv2.imshow("Laptop AI Director (RTX 5070 Ti)", display_frame)
 
-                # Render spatial map with live sensor data
+                # Spatial map: render_map() is ~790ms (heavy AA draw) — running it inline capped the whole
+                # loop at ~4fps and starved telemetry. It now renders in a background thread; here we only
+                # push fresh telemetry (cheap) and display the latest cached image (instant).
                 if hasattr(self, 'spatial_grid') and self.spatial_grid:
                     self.spatial_grid.set_telemetry(
                         heading_deg=env.get('heading', 0),
                         speed=env.get('speed', 0),
                         battery=env.get('battery', 0),
                     )
-                    spatial_map = self.spatial_grid.render_map()
-                    cv2.imshow("3D Spatial Map", spatial_map)
+                    if not getattr(self, '_spatial_thread_started', False):
+                        self._start_spatial_render_thread()
+                    cached_map = getattr(self, '_spatial_map_img', None)
+                    if cached_map is not None:
+                        cv2.imshow("3D Spatial Map", cached_map)
                 
                 # Record
                 if self.is_recording and video_out:
@@ -1288,6 +1748,35 @@ class DirectorCore:
                     # Scene classification
                     "scene_type": getattr(self, '_scene_type', 'unknown'),
 
+                    # HARDWARE / PHYSICS for the reasoning brain — live FC dynamics + the REAL
+                    # capability envelope, so Qwen reasons within what the airframe can ACTUALLY do
+                    # (thrust headroom from throttle/voltage, trim from roll/pitch, max lean/climb/accel).
+                    "flight_dynamics": {
+                        "airborne": bool(getattr(self, '_airborne', False)),
+                        "throttle_pct": fc_telem.get("throttle"),          # live hover point
+                        "pack_voltage_v": fc_telem.get("voltage"),
+                        "cell_voltage_v": fc_telem.get("cell_voltage"),
+                        "current_a": fc_telem.get("current"),
+                        "climb_rate_ms": fc_telem.get("climb_rate"),
+                        "roll_deg": fc_telem.get("roll"), "pitch_deg": fc_telem.get("pitch"),
+                        # LIVE WIND from the FC EKF estimate (ArduPilot WIND msg) — INFO ONLY. The AI does
+                        # NOT derate speed for wind (that was reverted per the design: the FC's position
+                        # controller in GUIDED/Loiter/PosHold rejects wind and holds the commanded velocity).
+                        # Bridge forwards the WIND MAVLink message into fc_telem['wind_speed'/'wind_dir'].
+                        "wind_speed_ms": fc_telem.get("wind_speed", fc_telem.get("wind")),
+                        "wind_dir_deg": fc_telem.get("wind_dir"),
+                    },
+                    # top-level too (the pilot + _drone_limits read either place)
+                    "wind_speed_ms": fc_telem.get("wind_speed", fc_telem.get("wind")),
+                    "wind_dir_deg": fc_telem.get("wind_dir"),
+                    "capabilities": (lambda c: {
+                        "max_lean_deg":       round(c.get('ANGLE_MAX', 6000) / 100.0, 1),
+                        "max_climb_ms":       round(c.get('PILOT_SPEED_UP', 500) / 100.0, 2),
+                        "max_descent_ms":     round(c.get('PILOT_SPEED_DN', 150) / 100.0, 2),
+                        "max_horiz_speed_ms": round(c.get('WPNAV_SPEED', 1000) / 100.0, 2),
+                        "max_vert_accel_ms2": round(c.get('PILOT_ACCEL_Z', 250) / 100.0, 2),
+                    })(fc_telem.get('fc_caps') or {}),
+
                     # Timestamp
                     "timestamp": time.time()
                 }
@@ -1354,30 +1843,24 @@ class DirectorCore:
         
         # 1. Simple Actions (Remote Execution via Bridge Safety Check)
         if action == "takeoff":
-            await self.ws.send_message({
-                "type": "command", 
-                "payload": {"action": "TAKEOFF"}
-            })
+            # Bridge process_packet reads the command from payload['command'] (NOT 'action'), so send that
+            # shape. self.ws.send() is the ONLY real method (there is no send_message).
+            await self.ws.send({"type": "command", "payload": {"command": "TAKEOFF"}})
             return
         elif action == "land":
-            await self.ws.send_message({
-                "type": "command", 
-                "payload": {"action": "LAND"}
-            })
+            await self.ws.send({"type": "command", "payload": {"command": "LAND"}})
             return
         elif action == "rth":
-            # Respect user preference for RTH behavior
-            if self.rth_behavior == "user":
-                 # Trigger Smart User Return via job injection (handled elsewhere) or send plan
-                 await self.ws.send_message({
-                    "type": "command",
-                    "payload": {"action": "RTL_SMART", "lat": self.last_known_user_loc[0], "lng": self.last_known_user_loc[1]} if self.last_known_user_loc else {"action": "RTH"}
-                 })
+            # Return per the app's rth_behavior. RETURN_TO_USER = fly to the user's live GPS; RTL = home.
+            # (The bridge's RTL branch also honours its own app-set batt_rth_destination.)
+            if self.rth_behavior == "user" and self.last_known_user_loc:
+                 await self.ws.send({"type": "command", "payload": {
+                    "command": "RETURN_TO_USER",
+                    "payload": {"lat": self.last_known_user_loc[0], "lng": self.last_known_user_loc[1]}}})
+            elif self.rth_behavior == "land":
+                 await self.ws.send({"type": "command", "payload": {"command": "LAND"}})
             else:
-                 await self.ws.send_message({
-                    "type": "command",
-                    "payload": {"action": "RTH"}
-                 })
+                 await self.ws.send({"type": "command", "payload": {"command": "RTL"}})
             return
 
         # 2. Cinematic Actions (Requires UltraDirector)
@@ -1517,21 +2000,22 @@ class DirectorCore:
                  # In real usage we'd parse .boxes properly
                  pass
 
-            # 3. Dynamic Grading (Unified Pipeline)
-            if hasattr(self, 'cam_pipeline') and self.cam_pipeline:
+            # 3. Dynamic Grading (Unified Pipeline) — BEAUTIFY. Gated OFF during flight (default) so the
+            # GPU stays on the pilot; footage records RAW and is beautified later as a post-process.
+            if self._cinematic_render and hasattr(self, 'cam_pipeline') and self.cam_pipeline:
                  # Check if the Plan updated the style
                  if hasattr(self, 'current_style_params'):
                      # Apply style from Cloud AI (e.g. "Post Apocalyptic" -> generic_flat with low sat)
                      if self.cam_pipeline.color:
                          self.cam_pipeline.color.current_style = self.current_style_params
-                 
+
                  # Process Frame (Lens -> Deblur -> HDR -> Color -> SuperRes)
                  processed_frame = self.cam_pipeline.process(raw_frame)
                  if processed_frame is not None:
                      display_frame = processed_frame
 
             # Legacy Fallback (if pipeline init failed)
-            elif self.tone_engine:
+            elif self._cinematic_render and self.tone_engine:
                  stats = self.tone_engine.analyze(raw_frame)
                  grade = self.tone_engine.propose_grade(stats)
                  display_frame = self.tone_engine.apply_grade(raw_frame, grade)
@@ -1635,9 +2119,10 @@ class DirectorCore:
                 
                 # Send Command if Confidence High
                 if gimbal_cmd['confidence'] > 0.1:
-                     await self.ws.send_message({
-                        "type": "command", 
-                        "payload": {"action": "GIMBAL", "pitch": gimbal_cmd['pitch'], "yaw": gimbal_cmd['yaw']}
+                     # Bridge has a direct 'gimbal' packet handler (process_packet type=='gimbal').
+                     await self.ws.send({
+                        "type": "gimbal",
+                        "payload": {"pitch": gimbal_cmd['pitch'], "yaw": gimbal_cmd['yaw']}
                      })
 
             # 9. AUTO-EDITOR (Smart Clips) & CINEMATIC FEEDBACK
@@ -1652,17 +2137,17 @@ class DirectorCore:
                      if not getattr(self, 'cinematic_mode_active', False):
                          print("🎬 ACTION DETECTED: Engaging Cinematic Flight Mode (Slower, Smoother)")
                          self.cinematic_mode_active = True
-                         await self.ws.send_message({
+                         await self.ws.send({
                             "type": "command",
-                            "payload": {"action": "SET_SPEED", "value": 2.0} # Slow down to 2m/s
+                            "payload": {"command": "SET_SPEED", "payload": {"value": 2.0}} # Slow to 2m/s
                          })
                 elif getattr(self, 'cinematic_mode_active', False):
                      # Revert to Normal
                      print("🎬 Action Ends: Resuming Normal Flight")
                      self.cinematic_mode_active = False
-                     await self.ws.send_message({
+                     await self.ws.send({
                         "type": "command",
-                        "payload": {"action": "SET_SPEED", "value": 5.0} # Normal 5m/s
+                        "payload": {"command": "SET_SPEED", "payload": {"value": 5.0}} # Normal 5m/s
                      })
 
             # 10. Network Yield
@@ -1705,36 +2190,45 @@ class DirectorCore:
             if t == "esp32_telem":
                 self.remote_esp_telem = packet.get("payload", {})
             elif t == "lidar_scan":
-                # Update Remote Obstacles
-                self.remote_obstacles = packet.get("payload", {}).get("points", [])
+                # Transform raw lidar points into the DRONE/FC grid frame (front=-y, right=+x),
+                # using the push-calibrated FC-forward bearing. Handles the lidar↔grid handedness.
+                raw_pts = packet.get("payload", {}).get("points", [])
+                af = math.radians(LIDAR_FRONT_BEARING_DEG)
+                sa, ca = math.sin(af), math.cos(af)
+                if LIDAR_HANDED < 0:
+                    # rotation + reflection: FC-front -> (0,-1), FC-right -> (1,0)
+                    self.remote_obstacles = [[sa * x - ca * y, -ca * x - sa * y] for x, y in raw_pts]
+                else:
+                    # pure rotation: bring FC-front (af) to grid-front (-90°)
+                    off = math.radians(-90.0 - LIDAR_FRONT_BEARING_DEG)
+                    c, s = math.cos(off), math.sin(off)
+                    self.remote_obstacles = [[x * c - y * s, x * s + y * c] for x, y in raw_pts]
             elif t == "ai_job":
+                self._ai_active = True  # ON-DEMAND: the AI-box message activates the brains
+                print(f"🧠 AI ACTIVATED by user message: {str(packet.get('text', packet.get('payload', '')))[:80]}")
+                # Only the PLANNER (process_job) calls Gemini for a command — one call per request.
+                # We set the mission for context but DON'T trigger the brain too (saves quota / no dup).
+                if hasattr(self, 'gemini_brain') and self.gemini_brain:
+                    self.gemini_brain.set_mission(str(packet.get('text', packet.get('payload', ''))))
                 asyncio.create_task(self.process_job(packet))
             elif t == "command":
                 cmd = packet.get("action", "").upper()
-                if cmd == "RTH":
-                     print(f"🏠 RTH TRIGGERED (Behavior: {self.rth_behavior.upper()})")
-                     if self.rth_behavior == "home":
-                         if self.autopilot.connected: 
-                             self.autopilot.return_to_launch()
-                             print("🚀 RETURNING TO LAUNCH (HOME)")
-                     else:
-                         # Smart Return to User (AI Job)
-                         if self.autopilot.connected and self.last_known_user_loc:
-                             print(f"📍 SMART RETURN TO USER: {self.last_known_user_loc}")
-                             # Inject synthetic job for Cloud Brain to plan path
-                             syn_job = {
-                                 "job_id": f"rth_{int(time.time())}",
-                                 "text": f"RETURN TO USER AT {self.last_known_user_loc}. USES SENSOR AVOIDANCE.",
-                                 "user_id": "system", "drone_id": "self"
-                             }
-                             asyncio.create_task(self.process_job(syn_job))
-                         else:
-                             print("⚠️ NO USER LOC. FALLBACK TO HOME.")
-                             self.autopilot.return_to_launch()
+                # TESTING SWITCH: flip the continuous ~2s Gemini loop live (no restart). The one-shot
+                # plan + Qwen pilot keep working regardless; this only gates the quota-heavy 2s loop.
+                if cmd in ("GEMINI_LOOP_ON", "GEMINI_LOOP_OFF", "GEMINI_LOOP"):
+                    self._gemini_loop_enabled = (not self._gemini_loop_enabled) if cmd == "GEMINI_LOOP" else (cmd == "GEMINI_LOOP_ON")
+                    print(f"🛰️ Gemini 2s loop -> {'ON' if self._gemini_loop_enabled else 'OFF (quota-safe)'}")
+                elif cmd == "RTH":
+                     # Manual return — obeys the SAME app settings (rth_behavior + GPS→land fallback).
+                     _fix = int((self.autopilot.get_telemetry() or {}).get('gps_fix', 0) or 0)
+                     self._execute_return(reason="manual RTH", have_gps=(_fix >= 3))
                 elif cmd == "LAND":
-                     if self.autopilot.connected: self.autopilot.execute_primitive({"action": "LAND"})
+                     self._ai_active = False  # landing stops the on-demand autonomous AI
+                     # Relay to the bridge — autopilot.execute_primitive() is a no-op on the laptop
+                     # (no MAVLink master); the bridge executes MAV_CMD_NAV_LAND / force-disarm.
+                     self._relay_cmd("LAND")
                 elif cmd == "TAKEOFF":
-                     if self.autopilot.connected: self.autopilot.execute_primitive({"action": "TAKEOFF"})
+                     self._relay_cmd("TAKEOFF")     # bridge does the real MAV_CMD_NAV_TAKEOFF
                 elif cmd == "START_RECORDING":
                      self.is_recording = True
                      print("🎥 MANUAL RECORD START")
@@ -1745,15 +2239,23 @@ class DirectorCore:
                      if hasattr(self, '_last_recording_path') and self._last_recording_path:
                          asyncio.create_task(self._upload_media_to_server(self._last_recording_path))
                 elif cmd in ["FOLLOW", "ORBIT", "DRONIE", "SCAN_AREA", "SCAN"]:
-                     print(f"🎬 SMART SHOT REQUEST: {cmd}")
-                     self.current_action = cmd
-                     # For FOLLOW, activate the FollowBrain visual servoing
-                     if cmd == "FOLLOW" and hasattr(self, 'follower') and self.follower:
-                         self.follower.active = True
-                         print("👁️ FollowBrain ACTIVATED — visual tracking mode")
-                     # Route to Autopilot Primitive
-                     if self.autopilot.connected:
-                         self.autopilot.execute_primitive({"action": cmd})
+                     # NO hardcoded shot velocities / no FollowBrain servo. The app's "smart shot"
+                     # buttons become PLAIN-LANGUAGE missions that the AI pilot (director + Qwen)
+                     # understands and flies ITSELF from live vision + sensors — identical to a typed
+                     # request. The AI generates the behaviour; nothing here scripts the move.
+                     _shot_text = {
+                         "FOLLOW":    "Follow the main subject in view — keep it centered and well framed at a safe following distance, reacting to its movement.",
+                         "ORBIT":     "Slowly orbit around the main subject in view, keeping it centered, one smooth full circle, then hold.",
+                         "DRONIE":    "Do a dronie reveal: start close on the subject, then fly smoothly backward and upward to reveal the whole scene.",
+                         "SCAN_AREA": "Explore and scan the area — sweep the space smoothly to reveal it while avoiding obstacles.",
+                         "SCAN":      "Explore and scan the area — sweep the space smoothly to reveal it while avoiding obstacles.",
+                     }.get(cmd, f"Perform a {cmd} shot, deciding the motion yourself from the live scene.")
+                     print(f"🎬 SMART SHOT → AI MISSION: {cmd}")
+                     self._ai_active = True
+                     asyncio.create_task(self.process_job({
+                         "job_id": f"shot_{int(time.time())}", "text": _shot_text,
+                         "user_id": "app", "drone_id": "self",
+                     }))
                 elif cmd == "CAPTURE_PHOTO":
                      print("📸 PHOTO REQUEST RECEIVED")
                      # We can just leverage the next loop iteration to save a frame or enable a 'one-shot' flag.
@@ -1769,8 +2271,16 @@ class DirectorCore:
                          print(f"⚙️ EXECUTING CONFIG CHANGE: {key} -> {val}")
                          
                          if key == "rth_behavior":
-                             self.rth_behavior = val.lower()
+                             self.rth_behavior = val.lower()   # home | user | land
                              print(f"⚙️ RTH BEHAVIOR: {self.rth_behavior.upper()}")
+
+                         elif key in ("return_battery_pct", "rth_battery", "low_battery_pct"):
+                             try:
+                                 self.return_battery_pct = max(5, min(90, int(float(val))))
+                                 self._auto_return_done = False
+                                 print(f"🔋 AUTO-RETURN AT BATTERY <= {self.return_battery_pct}%")
+                             except Exception:
+                                 pass
                          
                          elif key == "autonomous_mode":
                              self.autonomous_mode = (val.lower() == "true")
@@ -1908,6 +2418,757 @@ class DirectorCore:
             traceback.print_exc()
             traceback.print_exc()
 
+    # 8 obstacle sectors as unit vectors in BODY frame (forward, right).
+    _AVOID_SECTORS = {
+        'front': (1.0, 0.0), 'front_right': (0.7071, 0.7071), 'right': (0.0, 1.0),
+        'back_right': (-0.7071, 0.7071), 'back': (-1.0, 0.0), 'back_left': (-0.7071, -0.7071),
+        'left': (0.0, -1.0), 'front_left': (0.7071, -0.7071),
+    }
+
+    def _caution_radius_m(self, speed):
+        """Velocity-adaptive caution radius (F450). Never below 2x arm (0.45 m); grows with
+        speed by reaction distance + braking distance so faster flight keeps more standoff."""
+        ARM = 0.225
+        MIN_STANDOFF = 2 * ARM          # 0.45 m
+        REACTION = 0.30                 # s of pilot/loop latency
+        DECEL = 2.5                     # m/s^2 achievable braking
+        r = MIN_STANDOFF + speed * REACTION + (speed * speed) / (2 * DECEL)
+        return max(MIN_STANDOFF, min(r, 2.5))
+
+    # ════════════════════════════════════════════════════════════════════════════════════════
+    # HYBRID PILOT  —  AI decides (semantic intent), CODE executes (precise velocity).
+    # Gemini plan -> Steps; MissionSequencer tracks progress; hybrid_control.resolve_intent makes the
+    # exact velocity from live clearances; local_avoid clamps it; send_velocity -> ArduPilot.
+    # This is the reliable replacement for raw-Qwen-velocity (the 3B can't emit precise/correct floats).
+    # ════════════════════════════════════════════════════════════════════════════════════════
+    def _build_hybrid_ctx(self):
+        """Live sensor state -> the ctx dict hybrid_control needs (ToF, 8-sector obstacles, alt, caps)."""
+        env = getattr(self, 'current_environment_state', {}) or {}
+        sg = getattr(self, 'spatial_grid', None)
+        tof = {"F": env.get("t1", 9999), "R": env.get("t2", 9999),
+               "B": env.get("t3", 9999), "L": env.get("t4", 9999)}
+        summ = dict(getattr(sg, '_obstacle_summary', {}) or {}) if sg is not None else {}
+        cap = env.get("capabilities", {}) or {}
+        caps = {"max_speed": cap.get("max_horiz_speed_ms", 0.6) or 0.6,
+                "max_climb": cap.get("max_climb_ms", 0.4) or 0.4,
+                "max_yaw": 55.0, "max_accel": 0.35}
+        now = time.time()
+        dt = max(0.02, min(0.5, now - getattr(self, '_hybrid_last_t', now)))
+        self._hybrid_last_t = now
+        return {"tof": tof, "obstacle_summary": summ, "alt": env.get("altitude", 0.0) or 0.0,
+                "heading": env.get("heading", 0.0) or 0.0, "caps": caps, "dt": dt, "t": now}
+
+    @staticmethod
+    def _pred_from_spec(spec):
+        """Build a measurable completion predicate from a structured {type,value} spec."""
+        if not isinstance(spec, dict):
+            return lambda c, s: False
+        k, v = spec.get("type"), spec.get("value")
+        table = {
+            "alt_at":        lambda c, s: c["alt"] >= (v or 0.5),
+            "alt_below":     lambda c, s: c["alt"] <= (v if v is not None else 0.12),
+            "front_within":  lambda c, s: c["tof"].get("F", 9999) <= (v or 70),
+            "corners":       lambda c, s: s.get("corners", 0) >= (v or 4),
+            "orbit":         lambda c, s: s.get("orbit_deg", 0) >= (v or 330),
+            "target_within": lambda c, s: s.get("target_dist", 9e9) <= (v or 1.0),
+            "found":         lambda c, s: s.get("target_found", False),
+            "timeout":       lambda c, s: (c.get("t", 0) - s.get("step_entered_t", c.get("t", 0))) >= (v or 5),
+            "never":         lambda c, s: False,
+        }
+        return table.get(k, lambda c, s: False)
+
+    def _steps_from_plan(self, plan):
+        """plan = list of {name, maneuver, <intent params>, done:{type,value}} -> [hybrid_control.Step].
+        Returns None if the plan isn't a valid structured maneuver plan (caller then falls back)."""
+        if not isinstance(plan, list) or not plan:
+            return None
+        valid_man = {"HOLD", "GOTO", "ASCEND", "DESCEND", "SCAN", "ORBIT", "FOLLOW", "WALL_FOLLOW"}
+        steps = []
+        for i, p in enumerate(plan):
+            if not isinstance(p, dict):
+                return None
+            man = str(p.get("maneuver", "")).upper()
+            if man not in valid_man:
+                return None
+            intent = {kk: p[kk] for kk in
+                      ("maneuver", "bearing_deg", "target_alt_m", "target_bearing_deg",
+                       "target_dist_m", "yaw_dir", "side", "pace", "target_label") if kk in p}
+            intent["maneuver"] = man
+            done = self._pred_from_spec(p.get("done", {"type": "timeout", "value": 6}))
+            steps.append(hybrid_control.Step(p.get("name", man), intent, done,
+                                             subgoal_text=p.get("goal", p.get("name", man))))
+        return steps
+
+    def _hybrid_plan_from_raw(self, raw):
+        """Build a structured maneuver plan from the AI director's output (NO keyword routing — the
+        plan is the AI's). Looks for an explicit `hybrid_plan` list, or `sequence_plan.phases` that
+        already carry a `maneuver` + `done`. Returns [Step] or None (caller falls back to Qwen pilot)."""
+        if not isinstance(raw, dict):
+            return None
+        plan = raw.get("hybrid_plan")
+        if plan is None:
+            phases = (raw.get("sequence_plan", {}) or {}).get("phases") or []
+            plan = [p for p in phases if isinstance(p, dict) and p.get("maneuver")] or None
+        try:
+            return self._steps_from_plan(plan)
+        except Exception as e:
+            print(f"⚠️ hybrid plan build failed ({e}); using continuous pilot.")
+            return None
+
+    def _hybrid_tick(self):
+        """One control tick (called from the vision loop when a hybrid mission is active + airborne).
+        Builds ctx, runs the sequencer (resolve_intent + local_avoid), commands the FC. Returns True if
+        it took control this frame."""
+        seq = getattr(self, '_hybrid_seq', None)
+        if seq is None or not getattr(self, '_airborne', False):
+            return False
+        if time.time() < getattr(self, '_command_until', 0.0):
+            return True                                   # yield during takeoff reservation
+        try:
+            ctx = self._build_hybrid_ctx()
+            prev = getattr(self, '_hybrid_prev', (0.0, 0.0, 0.0, 0.0))
+            self._inject_semantic_target(seq, ctx)        # perception/Qwen updates the active target
+            vx, vy, vz, yaw, name = seq.tick(ctx, prev)
+            self._hybrid_prev = (vx, vy, vz, yaw)
+            self.autopilot.send_velocity(vx, vy, vz, yaw_rate=yaw)
+            if name == "DONE":
+                seq.finished = True
+        except Exception as e:
+            print(f"⚠️ hybrid tick error: {e}")
+        return True
+
+    def _inject_semantic_target(self, seq, ctx):
+        """Feed the active step's target from perception (detections) — the connection where Qwen's
+        semantic choice + the detector's geometry meet the resolver. Safe no-op if no target is set."""
+        step = seq.current()
+        if step is None:
+            return
+        label = step.intent.get("target_label")
+        if not label:
+            return
+        dets = getattr(self, '_last_detections', None) or []
+        match = next((d for d in dets if label.lower() in str(d.get("class", "")).lower()), None)
+        if match and match.get("bearing_deg") is not None:
+            step.intent["bearing_deg"] = match["bearing_deg"]
+            step.intent["target_bearing_deg"] = match["bearing_deg"]
+            if match.get("distance_m") is not None:
+                step.intent["subject_dist_m"] = match["distance_m"]
+                seq.state["target_dist"] = match["distance_m"]
+                seq.state["target_found"] = True
+
+    async def _run_hybrid_mission(self, plan_steps, job_id=None):
+        """Arm + take off, then let the deterministic sequencer fly the structured plan precisely
+        (the vision loop calls _hybrid_tick each frame). Ends on completion / STOP / disarm.
+        ⚠️ Physically arms + flies the drone."""
+        self._mission_id += 1
+        my_id = self._mission_id
+        try:
+            self._command_until = time.time() + 12.0
+            if not getattr(self, '_airborne', False):
+                if not await self._arm_and_takeoff():
+                    self._command_until = 0.0
+                    if job_id is not None:
+                        await self._notify_complete(job_id, "mission", "(takeoff failed — check arming)")
+                    return
+            self._hybrid_prev = (0.0, 0.0, 0.0, 0.0)
+            self._hybrid_seq = hybrid_control.MissionSequencer(plan_steps)
+            self._mission_active = True
+            self._command_until = 0.0   # release -> _hybrid_tick drives every frame
+            print(f"🧩 HYBRID MISSION → {len(plan_steps)} steps (sequencer + resolver + avoid)")
+            while getattr(self, '_mission_active', False) and self._mission_id == my_id:
+                if not int(self.autopilot.get_telemetry().get('armed', 0) or 0):
+                    self._airborne = False
+                    self._mission_active = False
+                    print("🛑 Disarmed — hybrid mission ended (motors stay off).")
+                    break
+                if self._hybrid_seq is None or getattr(self._hybrid_seq, 'finished', False):
+                    print("✅ Hybrid plan complete.")
+                    break
+                await asyncio.sleep(0.2)
+            if job_id is not None and self._mission_id == my_id:
+                await self._notify_complete(job_id, "mission", "(hybrid mission ended)")
+        except Exception as e:
+            print(f"⚠️ hybrid mission error: {e}")
+            if job_id is not None:
+                try: await self._notify_complete(job_id, "mission", "(error)")
+                except Exception: pass
+        finally:
+            if self._mission_id == my_id:
+                self._hybrid_seq = None
+                self._mission_active = False
+                self._command_until = 0.0
+
+    def _manage_flight_mode(self, vx, vy, vz):
+        """Let the AI WORK ArduPilot's flight MODES (the FC then does stabilisation + wind rejection, which
+        is the FC's job — the AI does not estimate wind):
+          • critical battery  -> RTL   (return to launch)
+          • sustained hold with a GPS lock -> LOITER (the FC HOLDS position & rejects wind precisely,
+            instead of us streaming zero-velocity in GUIDED)
+          • otherwise -> GUIDED (the FC follows our wind-rejected velocity setpoints)
+        Returns True if a HOLD/RETURN mode took over (caller then does NOT stream velocity). Acts ONLY with
+        a 3D GPS fix; indoors/no-GPS it is a no-op so the verified no-GPS path is unchanged. Hysteresis
+        (2s) prevents mode flapping. ⚠️ Untested on hardware — needs the new GPS + a real flight."""
+        try:
+            telem = self.autopilot.get_telemetry() or {}
+        except Exception:
+            telem = {}
+        now = time.time()
+        gps_fix = int(telem.get('gps_fix', 0) or 0)
+        batt = telem.get('battery')
+        # === AUTO-RETURN FAILSAFE — fires at the USER'S app-set battery threshold, to the USER'S app-set
+        #     destination (home/user/land). No hardcoded %; the app owns it. Works with OR without GPS
+        #     (no GPS -> LAND). Latched so it triggers once; resets if the battery recovers (pack swap). ===
+        thresh = getattr(self, 'return_battery_pct', 20)
+        if batt is not None and float(batt) <= thresh:
+            if not getattr(self, '_auto_return_done', False):
+                self._auto_return_done = True
+                self._execute_return(reason=f"battery {float(batt):.0f}% <= app threshold {thresh}%",
+                                     have_gps=(gps_fix >= 3))
+            return True                                   # returning -> stop streaming pilot velocity
+        else:
+            self._auto_return_done = False
+        # === MODE MANAGEMENT (needs a GPS lock) — no-GPS -> no-op, existing path unchanged ===
+        if gps_fix < 3:
+            return False
+        if (abs(vx) + abs(vy) + abs(vz)) > 0.06:          # actively flying -> GUIDED velocity control
+            self._hold_since = now
+            self._apply_fc_mode('GUIDED'); return False
+        self._hold_since = getattr(self, '_hold_since', now)   # holding -> after 2s let the FC hold it
+        if now - self._hold_since > 2.0:
+            self._apply_fc_mode('LOITER'); return True
+        return False
+
+    def _execute_return(self, reason="", have_gps=True):
+        """Return the drone using the USER'S APP SETTINGS: rth_behavior = 'home'(RTL) | 'user'(fly to the
+        user's phone GPS, sensor-avoided) | 'land'(land in place). WITHOUT a GPS fix, home/user cannot
+        navigate (no position) -> fall back to LAND in place. Used by BOTH the low-battery failsafe AND the
+        manual RTH command so every return ALWAYS obeys the app's chosen destination."""
+        beh = str(getattr(self, 'rth_behavior', 'user')).lower()
+        print(f"🏠 RETURN ({reason}) -> app rth_behavior={beh.upper()} (gps={'yes' if have_gps else 'no'})")
+        # All returns go to the BRIDGE over WS — the laptop autopilot has no MAVLink master, so its
+        # return_to_launch()/execute_primitive() are dead no-ops. The bridge executes the real FC command.
+        try:
+            _loc = getattr(self, 'last_known_user_loc', None)
+            if beh == 'land' or (beh in ('home', 'user') and not have_gps):
+                if not have_gps and beh != 'land':
+                    print("   no GPS -> LAND in place (can't navigate home/to-user without a position fix)")
+                self._relay_cmd('LAND')
+            elif beh == 'user' and _loc:
+                self._relay_cmd('RETURN_TO_USER', lat=_loc[0], lng=_loc[1])
+            else:                                          # 'home', or 'user' with no stored user loc -> RTL
+                self._relay_cmd('RTL')
+        except Exception as e:
+            print(f"   return failed ({e}) -> RTL fallback")
+            self._relay_cmd('RTL')
+
+    def _goal_steer(self, vx, vy):
+        """GOAL-DIRECTED APPROACH — the mission-completion layer. When the director's TARGET is IN VIEW
+        (self._mission_target, set from the live detection + bearing), bias the horizontal velocity toward
+        its bearing so the drone APPROACHES it — but ONLY if that direction is clear (else keep the pilot's
+        avoidance so it detours). Code owns the ROUTE to the goal (Part B); the pilot supplies the semantic
+        'that IS the target'. No target in view -> no-op (pure exploration, unchanged)."""
+        mt = getattr(self, '_mission_target', None)
+        if not mt:
+            return vx, vy
+        env = getattr(self, 'current_environment_state', {}) or {}
+        deg = float(mt.get('bearing_deg', 0.0))                 # + = target to the right, body frame
+        C = float(env.get('tof_front', 400) or 400)
+        L = float(env.get('tof_left', 400) or 400)
+        R = float(env.get('tof_right', 400) or 400)
+        clr = C if abs(deg) <= 30 else (R if deg > 0 else L)
+        if clr < 70:                                            # target direction blocked -> let avoidance detour
+            return vx, vy
+        spd = math.hypot(vx, vy) or 0.30                        # ease toward it even if the pilot was hovering
+        tb = math.radians(deg)
+        gvx, gvy = spd * math.cos(tb), spd * math.sin(tb)       # velocity toward the target (vx=fwd, vy=right)
+        return 0.35 * vx + 0.65 * gvx, 0.35 * vy + 0.65 * gvy   # blend: mostly goal, keep some pilot avoidance
+
+    def _relay_cmd(self, command, **extra):
+        """Send a command to the RADXA BRIDGE over the same WS the velocity relay uses. This is the ONLY
+        path that reaches the FC from the laptop: on Windows the local autopilot runs in REMOTE mode
+        (self.master is None), so autopilot.set_mode()/return_to_launch() SILENTLY no-op. The bridge
+        (process_packet) reads the command name from payload['command'] and its args from payload['payload'].
+        Fire-and-forget from sync callers via create_task (an event loop is always running here)."""
+        try:
+            msg = {"type": "command", "payload": {"command": str(command).upper()}}
+            if extra:
+                msg["payload"]["payload"] = extra
+            asyncio.create_task(self.ws.send(msg))
+        except Exception as e:
+            if int(time.time()) % 10 == 0:
+                print(f"relay_cmd({command}) failed: {e}")
+
+    def _apply_fc_mode(self, mode):
+        """Command an ArduPilot mode, only when it actually changes (avoids spam). RELAYS to the bridge
+        (the local autopilot.set_mode is a no-op on the laptop — no MAVLink master); the bridge maps
+        GUIDED/LOITER/POSHOLD/RTL/etc to set_mode_send on the real FC link."""
+        if getattr(self, '_ai_fc_mode', None) == mode:
+            return
+        self._ai_fc_mode = mode
+        self._relay_cmd(mode)                     # the path that actually reaches the FC
+        try:
+            self.autopilot.set_mode(mode)         # harmless fallback if ever run ON the Radxa (has master)
+        except Exception:
+            pass
+        print(f"🛩️ AI selected FC mode: {mode} (FC now owns stabilisation / hold / return)")
+
+    def _planner_velocity(self, intent_vx, intent_vy, reach_m=3.0):
+        """OPT-IN local path planner (NAV_PLANNER=1). Build a drone-centred costmap from the live
+        fused obstacle points (metric-depth camera + LiDAR, body frame) and A*-route toward the pilot's
+        INTENDED direction. Returns (vx, vy, yaw_rate) in body frame, or None if no path (caller keeps
+        the pilot's velocity so reactive avoidance still handles it).
+        FRAME NOTE: both _camera_obstacle_points and remote_obstacles use the grid convention forward=-y,
+        so a costmap point (x_right, y_forward) = (p[0], -p[1]). Verify this on the real drone."""
+        cm = getattr(self, 'nav_planner', None)
+        if cm is None:
+            return None
+        try:
+            pts = []
+            for p in (getattr(self, '_camera_obstacle_points', None) or []):
+                pts.append((float(p[0]), -float(p[1])))
+            for p in (getattr(self, 'remote_obstacles', None) or []):
+                if isinstance(p, (list, tuple)) and len(p) >= 2:
+                    pts.append((float(p[0]), -float(p[1])))
+            cm.rebuild(pts)
+            mag = math.hypot(intent_vx, intent_vy)
+            if mag < 1e-3:
+                return None
+            # AXIS MAP: brain is (vx=forward, vy=right); the costmap is (goal_x=x_right, goal_y=y_fwd).
+            # So the goal's x_right = the brain's vy component, its y_fwd = the brain's vx component.
+            gx = intent_vy / mag * reach_m          # x_right
+            gy = intent_vx / mag * reach_m          # y_fwd
+            nvx, nvy, yaw_rate, _path = cm.plan_velocity(gx, gy, max_speed=min(0.5, max(0.2, mag)))
+            if nvx is None:
+                return None
+            # plan_velocity returns (vx=x_right component, vy=y_fwd component) -> map back to brain frame.
+            return (nvy, nvx, yaw_rate)
+        except Exception:
+            return None
+
+    def _smooth_cmd(self, vx, vy, vz, yaw):
+        """Jerk-limit the COMMANDED velocity toward the AI's freely-chosen target so motion ramps
+        smoothly (no burst, no abrupt change). The AI stays FREE to pick the target — this only bounds
+        the RATE of change. NOTE: a 0,0,0 command = HOVER (motors keep spinning), never zero-RPM; only
+        a deliberate DISARM cuts motors, and never while airborne via this path."""
+        now = time.time()
+        dt = max(0.02, min(0.5, now - getattr(self, '_cmd_prev_t', now)))
+        self._cmd_prev_t = now
+        pv = getattr(self, '_cmd_prev', (0.0, 0.0, 0.0, 0.0))
+        # Ramp limits DERIVED FROM THIS DRONE (not a flat constant): the max horizontal accel a heavier/
+        # lower-thrust airframe can sustain = g·tan(tilt); we cap tilt conservatively for smooth indoor
+        # ramps. Yaw ramp from the drone's max yaw rate. So a 1.6kg build ramps at ITS accel, not generic.
+        if not hasattr(self, '_ramp_amax'):
+            try:
+                tilt = min(float(getattr(DroneConfig, 'MAX_TILT_ANGLE', 60)), 25.0)   # indoor-smooth cap
+                self._ramp_amax = 9.81 * math.tan(math.radians(tilt))                  # m/s²
+                self._ramp_ymax = float(getattr(DroneConfig, 'MAX_YAW_RATE', 60)) * 2.0
+            except Exception:
+                self._ramp_amax, self._ramp_ymax = 4.0, 120.0
+        amax = self._ramp_amax * dt          # this drone's sustainable horizontal accel × dt
+        ymax = self._ramp_ymax * dt          # this drone's yaw-accel × dt
+        def _r(p, t, m):
+            d = t - p
+            return p + (m if d > m else -m if d < -m else d)
+        nv = (_r(pv[0], vx, amax), _r(pv[1], vy, amax), _r(pv[2], vz, amax), _r(pv[3], yaw, ymax))
+        self._cmd_prev = nv
+        return nv
+
+    def _reactive_avoidance(self, vx, vy, vz):
+        """
+        Direction-aware obstacle avoidance (NOT a blind freeze):
+          • velocity-adaptive caution radius,
+          • BRAKE only the velocity component heading INTO a near sector,
+          • ADD a dodge-repulsion AWAY from near / INCOMING sectors (closing-rate boosted),
+          • vz (vertical) is never blocked by the horizontal LiDAR/ToF.
+        A hover (vx=vy=0) near an approaching object is still pushed away → active evasion.
+        Returns the safe (vx, vy, vz). vx=forward, vy=right (BODY_NED).
+        """
+        sg = getattr(self, 'spatial_grid', None)
+        summ = dict(getattr(sg, '_obstacle_summary', {}) or {}) if sg else {}
+        if not summ:
+            return vx, vy, vz
+        caution = self._caution_radius_m(math.hypot(vx, vy))
+        now = time.time()
+        prev = getattr(self, '_avoid_prev', {})
+        dt = max(1e-3, now - getattr(self, '_avoid_prev_t', now))
+        brake_f, brake_r = vx, vy
+        rep_f = rep_r = 0.0
+        for d, (uf, ur) in self._AVOID_SECTORS.items():
+            cm = summ.get(d)
+            if cm is None:
+                continue
+            dm = cm / 100.0
+            if dm >= caution:
+                continue
+            intrusion = (caution - dm) / caution                 # 0..1 (deeper = stronger)
+            closing = ((prev.get(d, cm) - cm) / 100.0) / dt       # m/s, +ve = approaching
+            boost = 1.0 + max(0.0, closing) * 1.5                 # evade incoming harder
+            rep_f -= uf * 0.55 * intrusion * boost               # push AWAY from obstacle
+            rep_r -= ur * 0.55 * intrusion * boost
+            toward = brake_f * uf + brake_r * ur                 # commanded motion into sector?
+            if toward > 0:
+                brake_f -= uf * toward * intrusion               # brake only that component
+                brake_r -= ur * toward * intrusion
+        self._avoid_prev = summ
+        self._avoid_prev_t = now
+        sf, sr = brake_f + rep_f, brake_r + rep_r
+        mag = math.hypot(sf, sr)
+        if mag > 0.5:                                            # cap horizontal speed
+            sf *= 0.5 / mag
+            sr *= 0.5 / mag
+        return sf, sr, vz
+
+    @staticmethod
+    def _clearance_speed_cap(cm):
+        """Stopping-distance table (identical to ER_BRAIN_PROMPT): max safe speed for a clearance (cm).
+        A quad brakes at ~2.5 m/s²; standoff = 2× rotor arm = 45 cm."""
+        if cm is None:
+            return 0.6                       # no reading in that direction → allow up to global max
+        if cm < 60:   return 0.0
+        if cm < 100:  return 0.20
+        if cm < 150:  return 0.35
+        if cm < 250:  return 0.50
+        return 0.60
+
+    def _enforce_clearance(self, vx, vy, vz):
+        """HARD SAFE-EXECUTION CLAMP (the zero-wrong guarantee): cap the pilot's raw vx/vy to the
+        stopping-distance table using GROUND-TRUTH sector clearances, so a mis-computed AI speed can NEVER
+        execute into an obstacle. The AI keeps its chosen DIRECTION; code guarantees the SPEED is safe for
+        the ACTUAL clearance in that direction. Runs BEFORE _reactive_avoidance (which then adds dynamic
+        dodge). vz is untouched (horizontal LiDAR doesn't clear vertical). Returns (vx,vy,vz, clamped)."""
+        sg = getattr(self, 'spatial_grid', None)
+        summ = dict(getattr(sg, '_obstacle_summary', {}) or {}) if sg else {}
+        if not summ:
+            return vx, vy, vz, False
+        clamped = False
+        capf = self._clearance_speed_cap(summ.get('front' if vx >= 0 else 'back'))
+        if abs(vx) > capf:
+            vx = math.copysign(capf, vx); clamped = True
+        capr = self._clearance_speed_cap(summ.get('right' if vy >= 0 else 'left'))
+        if abs(vy) > capr:
+            vy = math.copysign(capr, vy); clamped = True
+        return vx, vy, vz, clamped
+
+    async def _notify_complete(self, job_id, summary, detail=""):
+        """Second app message: the task actually FINISHED (status=complete). The initial
+        'started' reply went out when the plan was made; this fires when the move is done."""
+        if not getattr(self, 'ws', None):
+            return
+        try:
+            await self.ws.send({
+                "type": "ai_response",
+                "payload": {
+                    "job_id": job_id,
+                    "status": "complete",
+                    "action": "DONE",
+                    "thought": f"✅ Task complete — {summary} executed{(' ' + detail) if detail else ''}. Holding position.",
+                },
+            })
+        except Exception:
+            pass
+
+    async def _arm_and_takeoff(self, climb_vz=-0.35, climb_s=2.0, target_alt_m=0.6):
+        """
+        Autonomous no-GPS liftoff: ARM (bridge forces STABILIZE + arms), CONFIRM armed from FC
+        telemetry, then gently climb (ALT_HOLD throttle via RC override) to a low hover.
+        Sets self._airborne=True on success. Returns False WITHOUT spinning up if arming can't be
+        confirmed — nothing flies from a disarmed drone, so we never blind-send throttle.
+        ⚠️ This physically arms + lifts the drone.
+        """
+        if getattr(self, '_airborne', False):
+            return True
+        print("🔫 ARM requested (no-GPS STABILIZE) …")
+        try:
+            await self.ws.send({"type": "command", "payload": "ARM"})
+        except Exception as e:
+            print(f"⚠️ arm send failed: {e}")
+        # Confirm armed from FC telemetry (up to ~5s) BEFORE spinning anything.
+        t0 = time.time()
+        while time.time() - t0 < 5.0:
+            if int(self.autopilot.get_telemetry().get('armed', 0) or 0):
+                break
+            await asyncio.sleep(0.25)
+        if not int(self.autopilot.get_telemetry().get('armed', 0) or 0):
+            print("⚠️ ARM not confirmed — aborting takeoff (motors stay off).")
+            return False
+        print("✅ Armed. Gentle liftoff …")
+        # Open-loop climb to a low hover (early-stop once baro altitude reaches target).
+        # RAMP the throttle from 0 -> climb_vz over the first ~1.3s so it eases off the ground
+        # instead of bursting to full climb in one step (the "fast spin" you saw).
+        RAMP_S = 1.3
+        t0 = time.time()
+        while time.time() - t0 < climb_s:
+            # KILL-RESPECT: abort the instant the user disarms.
+            if not int(self.autopilot.get_telemetry().get('armed', 0) or 0):
+                self._airborne = False
+                print("🛑 Disarmed during takeoff — aborting (motors stay off).")
+                return False
+            ramp = min(1.0, (time.time() - t0) / RAMP_S)        # 0 -> 1 smooth spool-up
+            self.autopilot.send_velocity(0.0, 0.0, climb_vz * ramp)   # vz<0 = up
+            try:
+                alt = float(self.autopilot.get_telemetry().get('altitude_baro', 0) or 0)
+            except Exception:
+                alt = 0.0
+            if alt >= target_alt_m:
+                break
+            await asyncio.sleep(0.1)
+        self.autopilot.send_velocity(0.0, 0.0, 0.0)            # hold the hover
+        self._airborne = True
+        print("✅ Airborne — hovering, ready to fly the path.")
+        return True
+
+    def _build_fused_ai_frame(self, frame, det_list, env):
+        """Overlay the SENSOR FEED onto the camera frame so the pilot VLM gets ONE fused image =
+        precise depth + object recognition + per-object distance + 360° obstacle map + ToF =
+        complete spatially-grounded environmental understanding (not disconnected numbers). Cheap
+        draws; depth + LiDAR shown as corner insets so the RGB needed for recognition stays intact.
+        Returns the annotated BGR frame (or the original on any error)."""
+        try:
+            import numpy as _np
+            if frame is None:
+                return None
+            img = frame.copy()
+            H, W = img.shape[:2]
+            # object boxes + class + metric distance (recognition + depth, grounded in the image)
+            for o in (det_list or []):
+                bx = o.get("box")
+                if not bx:
+                    continue
+                x1, y1, x2, y2 = [int(v) for v in bx]
+                cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                lbl = str(o.get("class", "?"))
+                if o.get("distance_m") is not None:
+                    lbl += f" {o['distance_m']}m"
+                cv2.putText(img, lbl, (x1, max(12, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+            # ToF directional distances at the 4 edges (cm)
+            def _tf(k1, k2):
+                v = env.get(k1, env.get(k2))
+                return None if v in (None, 9999, -1) else v
+            tF, tB, tL, tR = _tf('t1', 'tof_front'), _tf('t3', 'tof_back'), _tf('t4', 'tof_left'), _tf('t2', 'tof_right')
+            if tF is not None: cv2.putText(img, f"F {tF}cm", (W // 2 - 40, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+            if tB is not None: cv2.putText(img, f"B {tB}cm", (W // 2 - 40, H - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+            if tL is not None: cv2.putText(img, f"L {tL}", (6, H // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+            if tR is not None: cv2.putText(img, f"R {tR}", (W - 64, H // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+            # nearest-obstacle banner (fused lidar+tof from spatial grid)
+            nc = env.get('spatial_closest_m')
+            if isinstance(nc, (int, float)) and nc < 500:
+                cv2.putText(img, f"NEAREST {nc:.0f}cm {env.get('spatial_closest_dir', '')}", (6, 18),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
+            iw, ih = W // 4, H // 4
+            # DEPTH colormap inset (top-right)
+            dm = getattr(self, '_latest_depth_map', None)
+            if dm is not None:
+                try:
+                    d = dm.astype(_np.float32)
+                    rng = max(1e-6, float(d.max() - d.min()))
+                    d8 = (255 * (d - d.min()) / rng).astype('uint8')
+                    dcol = cv2.resize(cv2.applyColorMap(d8, cv2.COLORMAP_INFERNO), (iw, ih))
+                    img[2:2 + ih, W - iw - 2:W - 2] = dcol
+                    cv2.putText(img, "DEPTH", (W - iw, 2 + ih - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+                except Exception:
+                    pass
+            # 360° LiDAR top-down map inset (top-left, cached render)
+            sm = getattr(self, '_spatial_map_img', None)
+            if sm is not None:
+                try:
+                    smr = cv2.resize(sm, (iw, ih))
+                    if smr.ndim == 2:
+                        smr = cv2.cvtColor(smr, cv2.COLOR_GRAY2BGR)
+                    img[2:2 + ih, 2:2 + iw] = smr[:, :, :3]
+                    cv2.putText(img, "LIDAR360", (4, 2 + ih + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+                except Exception:
+                    pass
+            return img
+        except Exception:
+            return frame
+
+    async def _run_continuous_mission(self, mission_text, job_id=None):
+        """Gemini's ONE strategic command -> a PERSISTENT goal that Qwen (+ Pi0/YOLO/depth) pursue
+        CONTINUOUSLY with LIVE sensors until stopped (user STOP/LAND or disarm). No baked open-loop
+        waypoints — Qwen flies it closed-loop from the live frame + ToF/LiDAR/depth every cycle.
+        Arms + lifts off gently first, then hands the stick to Qwen and keeps the intent FRESH
+        (a 'stale' intent makes the 3B model hover). ⚠️ This physically arms + flies the drone."""
+        self._mission_id += 1
+        my_id = self._mission_id
+        try:
+            # 1. Lift off (gentle ramp lives in _arm_and_takeoff). Reserve motors only for takeoff.
+            self._command_until = time.time() + 12.0
+            if not getattr(self, '_airborne', False):
+                if not await self._arm_and_takeoff():
+                    self._command_until = 0.0
+                    if job_id is not None:
+                        await self._notify_complete(job_id, "mission", "(takeoff failed — check arming)")
+                    return
+            # 2. Hand the stick to Qwen: set the persistent intent + mark the mission active.
+            self._mission_active = True
+            self._mission_text = mission_text
+            self.er_brain.set_director_intent(mission_text)
+            if hasattr(self, 'gemini_brain') and self.gemini_brain:
+                try: self.gemini_brain.set_mission(mission_text)
+                except Exception: pass
+            self._command_until = 0.0   # release -> the ER (Qwen) loop now drives every frame
+            print(f"🧠 CONTINUOUS MISSION → QWEN: {mission_text[:90]}")
+            # 3. Keep the intent FRESH (<3s) so Qwen keeps pursuing instead of hovering on 'stale'.
+            #    Ends when stopped (STOP/LAND clears _mission_active), superseded (new mission bumps
+            #    _mission_id), or the drone disarms.
+            while getattr(self, '_mission_active', False) and self._mission_id == my_id:
+                if not int(self.autopilot.get_telemetry().get('armed', 0) or 0):
+                    self._airborne = False
+                    self._mission_active = False
+                    print("🛑 Disarmed — continuous mission ended (motors stay off).")
+                    break
+                self.er_brain.set_director_intent(mission_text)   # re-stamp = stays FRESH
+                await asyncio.sleep(1.5)
+            if job_id is not None and self._mission_id == my_id:
+                await self._notify_complete(job_id, "mission", "(mission ended)")
+        except Exception as e:
+            if self._mission_id == my_id:
+                self._mission_active = False
+                self._command_until = 0.0
+            print(f"⚠️ mission error: {e}")
+            if job_id is not None:
+                await self._notify_complete(job_id, "mission", "(interrupted)")
+
+    async def _execute_relative_path(self, points, speed=0.3, job_id=None, summary=""):
+        """
+        Fly the FULL relative trajectory LEG-BY-LEG (no GPS — open-loop / dead-reckoning).
+        points: CUMULATIVE waypoints in drone body frame, METRES, [right(+x), forward(+y), up(+z)],
+        starting near [0,0,0]. We fly each consecutive leg in order so multi-waypoint missions
+        (e.g. "up 50cm THEN round the room") execute in FULL — previously we flew only points[-1],
+        which collapsed the whole path to a single hop to the endpoint (the "it skipped the round" bug).
+        The reactive caution-radius + dodge filter still curves each leg in real time.
+        """
+        try:
+            if not points:
+                return
+            pts = [[float(p[0]), float(p[1]), float(p[2])] for p in points if len(p) >= 3]
+            if not pts:
+                return
+            # Ensure the path starts at the drone's current pose so leg 1 is measured from here.
+            if abs(pts[0][0]) > 0.02 or abs(pts[0][1]) > 0.02 or abs(pts[0][2]) > 0.02:
+                pts = [[0.0, 0.0, 0.0]] + pts
+            legs = len(pts) - 1
+            if legs < 1:
+                return
+            speed = max(0.1, min(float(speed or 0.3), 0.5))     # gentle, capped
+            # Reserve the motors for the WHOLE trajectory so Qwen yields across every leg.
+            est = sum(min((((pts[i+1][0]-pts[i][0])**2 + (pts[i+1][1]-pts[i][1])**2
+                            + (pts[i+1][2]-pts[i][2])**2) ** 0.5) / speed, 8.0) for i in range(legs))
+            self._command_until = time.time() + est + 15.0   # reserve motors for arm+takeoff+path
+            # ARM + lift off first if grounded — nothing flies from a disarmed drone.
+            if not getattr(self, '_airborne', False):
+                if not await self._arm_and_takeoff():
+                    self._command_until = 0.0
+                    if job_id is not None:
+                        await self._notify_complete(job_id, summary or "move", "(takeoff failed — check arming)")
+                    return
+            self._command_until = time.time() + est + 2.0
+            print(f"🚀 TRAJECTORY: {legs} legs @ {speed:.2f}m/s (~{est:.1f}s total)")
+            for i in range(legs):
+                a, b = pts[i], pts[i+1]
+                rx, fy, uz = b[0]-a[0], b[1]-a[1], b[2]-a[2]    # this leg's delta
+                dist = (rx*rx + fy*fy + uz*uz) ** 0.5
+                if dist < 0.02:
+                    continue
+                dur = min(dist / speed, 8.0)
+                vx = (fy / dist) * speed                        # body forward
+                vy = (rx / dist) * speed                        # body right
+                vz = -(uz / dist) * speed                       # body down (up = negative)
+                print(f"  ➜ leg {i+1}/{legs}: {dist*100:.0f}cm v=({vx:.2f},{vy:.2f},{vz:.2f}) for {dur:.1f}s")
+                t0 = time.time()
+                while time.time() - t0 < dur:
+                    # KILL-RESPECT: if the user disarmed (app DISARM), STOP streaming instantly so
+                    # we never fight a kill. A disarmed drone must stay down.
+                    if not int(self.autopilot.get_telemetry().get('armed', 0) or 0):
+                        self._airborne = False
+                        self._command_until = 0.0
+                        print("🛑 Disarmed externally — aborting trajectory (motors stay off).")
+                        return
+                    # Same caution-radius + dodge filter so each leg still avoids/evades obstacles.
+                    svx, svy, svz = self._reactive_avoidance(vx, vy, vz)
+                    self.autopilot.send_velocity(svx, svy, svz)
+                    await asyncio.sleep(0.1)
+            self.autopilot.send_velocity(0, 0, 0)              # stop -> hold
+            self._command_until = 0.0
+            print(f"✅ TRAJECTORY complete: {legs} legs flown (holding)")
+            if job_id is not None:
+                await self._notify_complete(job_id, summary or "move", f"({legs} legs)")
+        except Exception as e:
+            self._command_until = 0.0
+            print(f"⚠️ trajectory error: {e}")
+            if job_id is not None:
+                await self._notify_complete(job_id, summary or "move", "(interrupted)")
+            try: self.autopilot.send_velocity(0, 0, 0)
+            except Exception: pass
+
+    def _fused_depth_scale(self):
+        """Best available metric scale for the depth map: the motion-TRIANGULATION anchor when it
+        has a fresh parallax lock (works with NO ToF hardware — the drone's motion is the baseline),
+        else the ToF-front anchor, else neutral. cm-class when locked."""
+        da = getattr(self, 'depth_anchor', None)
+        if da is not None and da.fresh():
+            return max(0.3, min(3.0, float(da.scale)))
+        return self._depth_scale()
+
+    def _depth_scale(self):
+        """Robust metric scale for the monocular depth map (#6): maps relative depth -> metres by
+        anchoring a MEDIAN over the centre region (not one noisy pixel) to the live ToF-front reading,
+        clamped so a bad sample can't explode distances. Shared by the Gemini planner + Qwen pilot."""
+        dm = getattr(self, '_latest_depth_map', None)
+        if dm is None:
+            return 1.0
+        try:
+            tof_mm = float((self.remote_esp_telem or {}).get('tof_front'))
+            if not tof_mm or tof_mm <= 0:
+                return 1.0
+            h, w = dm.shape[:2]
+            region = dm[int(h * 0.40):int(h * 0.60), int(w * 0.40):int(w * 0.60)]
+            rel = float(np.median(region)) if region.size else float(dm[h // 2, w // 2])
+            cm = 0.25 + (1.0 - rel) * (6.0 - 0.25)
+            if cm <= 0.05:
+                return 1.0
+            return max(0.3, min(3.0, (tof_mm / 1000.0) / cm))
+        except Exception:
+            return 1.0
+
+    def _perceive_objects(self, vision_context, frame):
+        """Fuse YOLO objects + monocular depth + ToF anchor -> per-object METRIC distance.
+        This is the 'sensor overlay on the video' the AI uses to judge how far each object is.
+        Returns [{"label","distance_m","bearing","conf"}]; best-effort (empty list if no data)."""
+        try:
+            dm = getattr(self, '_latest_depth_map', None)
+            objs = (vision_context or {}).get('objects') or []
+            if dm is None or frame is None or not objs:
+                return []
+            h_d, w_d = dm.shape[:2]
+            fh, fw = frame.shape[:2]
+            NEAR_M, FAR_M = 0.25, 6.0
+            rel2m = lambda v: NEAR_M + (1.0 - float(v)) * (FAR_M - NEAR_M)
+            # Anchor the relative depth to the LIVE ToF-front reading (mm) so distances are REAL
+            # metres, not a fixed guess. Frame centre ≈ what ToF-front measures -> solve the scale.
+            scale = self._fused_depth_scale()  # triangulation-first anchor, shared with the pilot
+            out = []
+            for o in objs:
+                box = o.get('bbox') or o.get('box') or o.get('xyxy')
+                if not box or len(box) < 4:
+                    continue
+                x1, y1, x2, y2 = [float(v) for v in box[:4]]
+                if max(x1, y1, x2, y2) > 1.5:           # pixels -> normalise to 0..1
+                    x1, x2, y1, y2 = x1 / fw, x2 / fw, y1 / fh, y2 / fh
+                cx = min(max((x1 + x2) / 2, 0.0), 1.0)
+                cy = min(max((y1 + y2) / 2, 0.0), 1.0)
+                dx, dy = int(cx * (w_d - 1)), int(cy * (h_d - 1))
+                dist = round(min(rel2m(float(dm[dy, dx])) * scale, 30.0), 2)
+                bearing = "front-left" if cx < 0.38 else ("front-right" if cx > 0.62 else "center")
+                out.append({
+                    "label": o.get('label') or o.get('cls') or o.get('class') or "object",
+                    "distance_m": dist, "bearing": bearing,
+                    "conf": round(float(o.get('conf', o.get('confidence', 0)) or 0), 2),
+                })
+            return out[:12]
+        except Exception:
+            return []
+
     async def process_job(self, job: dict):
         """
         Top-level job processing pipeline.
@@ -1928,18 +3189,23 @@ class DirectorCore:
         print(f"\n=== Starting job {job_id} text='{user_text[:50]}' ===")
         
         try:
-            # 1. Grab Frame
+            # 1. Grab Frame (OPTIONAL — flight commands fly on LiDAR/ToF/IMU, no camera needed).
             frame = await asyncio.to_thread(self._grab_frame, RTSP_URL, MAX_FRAME_WAIT)
             if frame is None:
-                await self._send_plan(job_id, user_id, drone_id, {"action": "HOVER"}, reason="no_frame")
-                return
+                # GoPro off/charging → no vision. DON'T bail to HOVER; plan SENSOR-ONLY so moves
+                # like "go up 20cm" still execute. (This camera-required bail was why every
+                # command turned into HOVER the moment the GoPro died.)
+                print("📷 No camera frame — planning SENSOR-ONLY (LiDAR/ToF/IMU).")
 
-            if DEBUG_SAVE_FRAME:
+            if DEBUG_SAVE_FRAME and frame is not None:
                 cv2.imwrite(os.path.join(TEMP_ARTIFACT_DIR, f"job_{job_id}_ctx.jpg"), frame)
 
-            # 2. Vision Context
-            vision_context, annotated = await asyncio.to_thread(self.tracker.process_frame, frame)
-            
+            # 2. Vision Context (defensive: tracker may be uninitialized / no camera — don't crash)
+            if frame is not None and self.tracker and hasattr(self.tracker, 'process_frame'):
+                vision_context, annotated = await asyncio.to_thread(self.tracker.process_frame, frame)
+            else:
+                vision_context, annotated = {"objects": [], "note": "no_camera" if frame is None else "tracker unavailable"}, frame
+
             # 3. Memory
             memory = read_memory(user_id, drone_id) or {}
             
@@ -1949,28 +3215,88 @@ class DirectorCore:
             
             # INJECT SENSOR DATA (Lidar + ESP32)
             # This makes the AI "REAL" and aware of its surroundings
+            _env = getattr(self, 'current_environment_state', {}) or {}
+            _fc = self.autopilot.get_telemetry() or {}          # = latest FC telemetry payload
+            _alt = float(_env.get('altitude', 0) or 0)
+            _armed = bool(_fc.get('armed', _env.get('armed', False)))
+            # Airborne = armed AND actually off the ground (real FC readings, not assumed).
+            _airborne = _armed and (_alt > 0.15 or abs(float(_fc.get('climb_rate', 0) or 0)) > 0.05)
+
+            # --- VISION + DEPTH + SENSOR FUSION (the AI's eyes) -------------------------------
+            # Attach the LIVE camera frame to the multimodal request so the AI SEES the scene.
+            # No frame (GoPro off) -> vision_images stays empty and the AI plans SENSOR-ONLY (the
+            # graceful fallback the user asked for). Downscaled to keep the relay/Gemini light.
+            vision_images = list(images) if images else []
+            if frame is not None:
+                try:
+                    _h0, _w0 = frame.shape[:2]
+                    _small = cv2.resize(frame, (640, int(_h0 * 640.0 / _w0))) if _w0 > 640 else frame
+                    _ok, _buf = cv2.imencode('.jpg', _small, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                    if _ok:
+                        vision_images.insert(0, bytes(_buf))   # live frame first
+                except Exception as _ie:
+                    print(f"frame encode skip: {_ie}")
+            # Per-object metric distance = depth map sampled at each YOLO box, scaled to live ToF.
+            objects_ranged = self._perceive_objects(vision_context, frame)
+
             full_sensor_context = {
                 "lidar_obstacles": self.remote_obstacles, # [[x,y], [x,y]]
                 "tof_sensors": self.remote_esp_telem, # {"tof_front": 1200, ...}
+                "objects": objects_ranged,            # [{label, distance_m, bearing, conf}] depth↔ToF fused
+                "has_camera": frame is not None,
+                "perception_note": ("LIVE image attached + per-object distances (depth↔ToF fused)"
+                                    if frame is not None else "NO camera — planning on LiDAR/ToF/IMU only"),
                 "battery": self.autopilot.get_telemetry().get('battery', 100),
                 "location": self.autopilot.get_position(),
                 "depth_to_subject_m": getattr(self, '_subject_depth_m', None),
                 "spatial_awareness": self.spatial_grid.get_spatial_description() if hasattr(self, 'spatial_grid') and self.spatial_grid else None,
-                "altitude": getattr(self, 'current_environment_state', {}).get('altitude', 0),
-                "speed": getattr(self, 'current_environment_state', {}).get('speed', 0),
+                "altitude": _alt,
+                "speed": _env.get('speed', 0),
+                # LIVE flight dynamics straight from the FC — the AI derives hover thrust / headroom /
+                # trim from THESE real readings (never hardcoded). throttle_pct may be None if the
+                # bridge doesn't forward VFR_HUD throttle yet.
+                "flight_dynamics": {
+                    "armed": _armed,
+                    "airborne": _airborne,
+                    "mode": _fc.get('mode', _fc.get('mode_id')),
+                    "pack_voltage_v": _fc.get('voltage'),
+                    "cell_voltage_v": _fc.get('cell_voltage'),
+                    "throttle_pct": _fc.get('throttle'),       # live hover point when airborne
+                    "current_a": _fc.get('current'),           # live current draw (A) -> power/thrust headroom
+                    "climb_rate_ms": _fc.get('climb_rate'),
+                    "roll_deg": _fc.get('roll'), "pitch_deg": _fc.get('pitch'), "yaw_deg": _fc.get('yaw'),
+                    "altitude_agl_m": _alt,
+                    "approx_all_up_weight_kg": DroneConfig.DRONE_WEIGHT,  # build prior (~1.6kg); refine from live throttle
+                    # LIVE capability envelope read from the FC — the drone's ACTUAL limits, not guesses.
+                    # IN FLIGHT, fly to these when the shot needs it; stay gentle only on takeoff/land.
+                    "capabilities": {
+                        "max_lean_deg":        round((_fc.get('fc_caps') or {}).get('ANGLE_MAX', 6000) / 100.0, 1),
+                        "max_climb_ms":        round((_fc.get('fc_caps') or {}).get('PILOT_SPEED_UP', 500) / 100.0, 2),
+                        "max_descent_ms":      round((_fc.get('fc_caps') or {}).get('PILOT_SPEED_DN', 150) / 100.0, 2),
+                        "max_vert_accel_ms2":  round((_fc.get('fc_caps') or {}).get('PILOT_ACCEL_Z', 250) / 100.0, 2),
+                        "max_horiz_speed_ms":  round((_fc.get('fc_caps') or {}).get('WPNAV_SPEED', 1000) / 100.0, 2),
+                        "max_horiz_accel_ms2": round((_fc.get('fc_caps') or {}).get('WPNAV_ACCEL', 250) / 100.0, 2),
+                        "source": "live FC" if (_fc.get('fc_caps')) else "FC defaults (caps not read yet)",
+                    },
+                },
             }
             
-            raw = await asyncio.to_thread(ask_gpt, user_text, vision_context, images, video_link, memory, sensor_data=full_sensor_context, api_keys=job_keys)
+            # ask_gpt is an async coroutine (aiohttp). AWAIT it directly — wrapping it in
+            # asyncio.to_thread returned the un-run coroutine (raw.get → 'coroutine' has no
+            # attribute 'get' → planning crashed → no plan → no motors).
+            raw = await ask_gpt(user_text, vision_context, vision_images, video_link, memory, sensor_data=full_sensor_context, api_keys=job_keys)
+            if raw is None:
+                raw = {"action": "HOVER"}
             
             # 5. Planning (Parsing New Rich Output)
             # The new AI outputs root: {thought_process, cinematic_style, execution_plan, technical_config}
             
             # Extract Style for Tone Engine
             cinematic_style = raw.get("cinematic_style", "cine_soft")
-            if self.tone_engine:
-                 print(f"🎨 Applying Cinematic Style: {cinematic_style}")
-                 # Update the Global Style State for the Vision Loop
-                 self.current_cinematic_style = cinematic_style
+            print(f"🎨 Applying Cinematic Style: {cinematic_style}")
+            # Update the Global Style State for the Vision Loop. (Was `if self.tone_engine:` —
+            # that attribute is only set conditionally and was missing → crashed the whole job.)
+            self.current_cinematic_style = cinematic_style
 
             execution_plan = raw.get("execution_plan", {})
             legacy_action = raw.get("action") # Fallback
@@ -2027,11 +3353,12 @@ class DirectorCore:
                 start_pos = primitive.get("params", {}).get("start_pos") or [0.0, 0.0, 2.5]
                 target_pos = primitive.get("params", {}).get("target_pos") or [1.5, 0.0, 2.5]
                 
-                curve, mode = self.ultra_director.plan_shot(primitive.get("params", {}), vision_context, start_pos, target_pos) if self.ultra_director else (None, "unsafe")
-                
+                _ud = getattr(self, 'ultra_director', None)
+                curve, mode = _ud.plan_shot(primitive.get("params", {}), vision_context, start_pos, target_pos) if _ud else (None, "unsafe")
+
                 if curve:
                     primitive["plan_curve"] = {
-                        "duration": self.ultra_director.duration if self.ultra_director else 5.0,
+                        "duration": _ud.duration if _ud else 5.0,
                         "control_points": [list(map(float, p)) for p in [curve.p0, curve.p1, curve.p2, curve.p3]]
                     }
                     primitive["meta"]["mode"] = mode
@@ -2071,10 +3398,60 @@ class DirectorCore:
             # 7. Final Send (Server)
             primitive = to_safe_primitive(primitive)
             await self._send_plan(job_id, user_id, drone_id, primitive, reason="ok")
-            
-            # 8. Local Execution (Fast)
+
+            # 7b. INITIAL reply to the APP — the director's reasoning + chosen action, sent the moment
+            # the plan is ready (status=started). A second 'complete' message follows when the move
+            # actually finishes flying (see _execute_relative_path / below).
+            try:
+                await self.ws.send({
+                    "type": "ai_response",
+                    "payload": {
+                        "job_id": job_id,
+                        "status": "started",
+                        "thought": raw.get("thought_process", "") or primitive.get("thought_process", "") or f"On it — planning: {user_text}",
+                        "action": primitive.get("action", "HOVER"),
+                        "style": raw.get("cinematic_style", ""),
+                        "reasoning": raw.get("thought_process", "") or f"Planning your request: {user_text}",
+                    },
+                })
+            except Exception:
+                pass
+
+            # 8. EXECUTION — THE AI FLIES IT. No hardcoded movements, no keyword routing, no action-
+            # label gating. EVERY AI request is handed to the CONTINUOUS Qwen pilot, which UNDERSTANDS
+            # the user's request (in plain language) + the director's strategic plan and AUTONOMOUSLY
+            # decides and flies ALL of it from live camera + ToF/LiDAR/depth — including whether to
+            # move or hold, the whole manoeuvre, and reacting to the room in real time. Gemini = the
+            # one-shot strategist; Qwen = the live reasoning pilot. The ONLY non-AI layer is the
+            # reactive-avoidance SAFETY clamp applied to Qwen's OWN velocities (never a scripted path).
+            # (Hard STOP / LAND / DISARM are the app's dedicated buttons → straight to the FC, not here.)
             if self.autopilot.connected:
-                self.autopilot.execute_primitive(primitive)
+                _ep = raw.get("execution_plan", {}) or {}
+                _mission = (raw.get("mission") or _ep.get("mission") or "").strip()
+                _thought = (raw.get("thought_process") or "").strip()
+                _seq = raw.get("sequence_plan", {}) or {}
+                _phases = _seq.get("phases") or []
+                _steps = "; ".join(
+                    f"{p.get('phase', i+1)}) {p.get('goal', p.get('action',''))}"
+                    for i, p in enumerate(_phases[:8]) if isinstance(p, dict))
+                _full = _mission or _thought
+                if _thought and _thought not in _full:
+                    _full += f" | WHY: {_thought}"
+                if _steps:
+                    _full += f" | STEPS: {_steps}"
+                # The pilot receives the user's RAW request and the director's plan, then reasons and
+                # flies the whole thing itself. Nothing here decides the movement — the AI does.
+                mission = f"USER REQUEST: {user_text}. DIRECTOR PLAN: {_full[:1400]}"
+                # DEFAULT = AI FLIES FREELY: Qwen chooses ALL movement live from the camera+sensors;
+                # the code only smooths the rate (no bursts) + reactive-avoidance safety. No hardcoded
+                # maneuvers. The deterministic maneuver-library (hybrid) is OPT-IN only (HYBRID_PILOT=1)
+                # for when you want guaranteed-precise structured execution on this weak 3B.
+                hplan = self._hybrid_plan_from_raw(raw) if os.getenv("HYBRID_PILOT") == "1" else None
+                if hplan:
+                    print(f"🧩 HYBRID pilot (opt-in via HYBRID_PILOT=1): {len(hplan)} structured steps.")
+                    asyncio.create_task(self._run_hybrid_mission(hplan, job_id))
+                else:
+                    asyncio.create_task(self._run_continuous_mission(mission, job_id))
             
         except Exception as e:
             print(f"Job Error: {e}")

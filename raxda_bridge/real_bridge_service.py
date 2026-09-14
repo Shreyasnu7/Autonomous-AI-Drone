@@ -5,6 +5,7 @@ import socket
 import time
 import os
 import aiohttp
+from aiohttp import web  # module-level so request handlers (handle_snapshot/handle_stream) can use `web`
 import websockets
 from pymavlink import mavutil
 
@@ -19,8 +20,12 @@ except ImportError:
     AVOIDANCE_AVAILABLE = False
     print("⚠️ Smart avoidance not available, using basic brake only")
 # --- CONFIG ---
-SERVER_URL = "wss://drone-server-r0qe.onrender.com/ws/connect/RADXA_X"
-API_URL = "https://drone-server-r0qe.onrender.com"
+# Cloud server (Render) — used when Tailscale direct connection not available
+SERVER_URL = os.environ.get("SERVER_URL", "wss://drone-server-r0qe.onrender.com/ws/connect/RADXA_X")
+API_URL = os.environ.get("API_URL", "https://drone-server-r0qe.onrender.com")
+# Tailscale IPs for direct streaming (faster than cloud relay)
+TAILSCALE_LAPTOP_IP = os.environ.get("TS_LAPTOP_IP", "100.84.75.22")
+TAILSCALE_PHONE_IP = os.environ.get("TS_PHONE_IP", "100.109.112.110")
 # Auto-detect FC UART port based on board
 # Cubie A7Z (Allwinner A733): /dev/ttyAS0 (Pin 8/10)
 # Radxa Zero 3W (RK3566): /dev/ttyS2 (Pin 8/10)
@@ -32,6 +37,12 @@ elif os.path.exists("/dev/ttyS0"):
 else:
     FC_PORT = os.environ.get("FC_PORT", "/dev/ttyS2")
 FC_BAUD = 57600
+
+# ===== BENCH SAFETY: block ALL automatic arming so propellers can NEVER spin =====
+# Drone is not in flight position. The bridge must not auto-arm or stick-arm the FC.
+# Set to False ONLY when the drone is set up correctly and you want to fly.
+ALLOW_AUTO_ARM = os.environ.get("ALLOW_AUTO_ARM", "0") == "1"
+
 # V60: Camera Constants
 CAM_WIDTH = 1280
 CAM_HEIGHT = 720
@@ -73,10 +84,10 @@ class SafetyEnvelope:
 
     # Actions that involve drone movement
     MOVEMENT_ACTIONS = {
-        'TAKEOFF', 'ARM', 'ORBIT', 'UPLOAD_MISSION', 'GUIDED',
+        'TAKEOFF', 'ORBIT', 'UPLOAD_MISSION', 'GUIDED',
         'GOTO', 'FOLLOW', 'VELOCITY', 'MOVE', 'AI_PLAN', 'CMD_VEL', 'COMMAND',
         'FOLLOW_ME', 'GUIDED', 'AUTO',
-    }
+    }  # NOTE: 'ARM' removed — arming just idles motors, must not be blocked by proximity (was blocking indoor arm)
 
     def __init__(self, telemetry_cache):
         self.telem = telemetry_cache
@@ -199,6 +210,11 @@ class RadxaBridge:
         self.is_armed = False # V107: Init missing state
         self.follow_me_active = False
         self.batt_rth_destination = 'launch'  # 'launch' or 'user'
+        # LiDAR → FC proximity ring calibration (bench-verify on Mission Planner's Proximity radar):
+        # an obstacle straight ahead must show at the TOP. If mirrored → flip LIDAR_DIR; if rotated →
+        # adjust LIDAR_YAW_OFFSET_DEG. Env-overridable so no code edit is needed to calibrate.
+        self.LIDAR_YAW_OFFSET_DEG = float(os.getenv('LIDAR_YAW_OFFSET_DEG', '0'))
+        self.LIDAR_DIR = int(os.getenv('LIDAR_DIR', '-1'))   # LiDAR CCW → ArduPilot CW
         self.watchdog_triggered = False # V107: Init missing state
         self.smoothing_buffer = {'rc1': 1500, 'rc2': 1500, 'rc3': 1000, 'rc4': 1500} # V40: Smoothing State
         self.esp32_cmd_queue = asyncio.Queue()  # Commands to send to ESP32
@@ -220,6 +236,9 @@ class RadxaBridge:
         # P3.0: LIDAR INTEGRATION
         self.lidar = None
         self.lidar_min_dist = 9.9  # meters, updated by lidar loop
+        # Initialize lidar cache — conservative defaults until lidar actually starts
+        self.telemetry_cache['lidar_status'] = "STARTING"
+        self.telemetry_cache['lidar_dist'] = 9.9  # Will be updated by lidar_loop
 
         # MA-29: Smart obstacle avoidance (potential field)
         self.obstacle_avoidance = ObstacleAvoidance() if AVOIDANCE_AVAILABLE else None
@@ -255,27 +274,10 @@ class RadxaBridge:
                                 except Exception:
                                     pass
 
-                    # === FALLBACK: WiFi Preview Stream ===
-                    ssid, password = await self.gopro_proxy.get_wifi_credentials()
-                    if ssid:
-                        print(f"🔵 GOPRO WiFi: SSID={ssid}")
-                        # Auto-connect Radxa to GoPro WiFi
-                        try:
-                            subprocess.run(
-                                ['nmcli', 'dev', 'wifi', 'connect', ssid,
-                                 'password', password],
-                                timeout=15, capture_output=True
-                            )
-                            print(f"📡 CONNECTED to GoPro WiFi: {ssid}")
-                        except Exception as e:
-                            print(f"⚠️ WiFi auto-connect failed: {e}")
-                            print(f"   Manual: nmcli dev wifi connect {ssid} password {password}")
-
-                    stream_ok = await self.gopro_proxy.start_preview_stream()
-                    if stream_ok:
-                        print("🎥 GOPRO WIFI PREVIEW STREAM: Active (udp://@0.0.0.0:8554)")
-                    else:
-                        print("⚠️ GOPRO STREAM: Failed to start — try manual WiFi connect")
+                    # GoPro WiFi: DISABLED at startup — switching kills cloud/Tailscale
+                    # WiFi switch will be triggered by app command when user is ready
+                    # BLE settings (resolution, color, shutter) work without WiFi
+                    print("ℹ️ GOPRO: BLE ready for settings. Send GOPRO_WIFI_ON to enable video stream.")
                 except Exception as e:
                     print(f"⚠️ GOPRO STREAM INIT: {e}")
         except Exception as e:
@@ -310,22 +312,55 @@ class RadxaBridge:
         print(f"AI PLAN: {action_name} | {p}")
 
         try:
-            # Ensure FC is in GUIDED mode so it follows our setpoints
-            # (ArduPilot ignores position/velocity targets in STABILIZE/ALT_HOLD)
-            current_mode = self.telemetry_cache.get('mode_id', '')
-            if str(current_mode) not in ('GUIDED', '4'):
-                self.fc.mav.set_mode_send(
-                    self.fc.target_system,
-                    mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-                    4  # GUIDED
-                )
-
             # --- VELOCITY COMMAND (vx, vy, vz present) ---
             has_velocity = any(k in p for k in ('vx', 'vy', 'vz'))
             # --- POSITION COMMAND (lat, lng present) ---
             has_gps = 'lat' in p and 'lng' in p
             # --- LOCAL POSITION (x, y, z in meters from home) ---
             has_local_pos = any(k in p for k in ('x', 'y', 'z')) and not has_velocity
+
+            # === INDOOR / NO-GPS FLIGHT: velocity -> RC override in ALT_HOLD ===
+            # RESTORED (wiped 6-30..7-02; original ssh patch 6-24 — this is what made the indoor
+            # flight work). ArduPilot ignores GUIDED velocity setpoints without a position estimate.
+            # With no 3D GPS fix we steer attitude directly; baro holds altitude. NOTE: once VISO
+            # (VISION_POSITION_ESTIMATE + EK3_SRC=ExternalNav) is configured, the FC HAS an indoor
+            # position and gps_fix stays <3 only until the EKF accepts it — this path remains the
+            # no-position fallback.
+            _has_vel_kick = any(k in p for k in ('vx', 'vy', 'vz', 'yaw_rate'))
+            _gps_fix = int(self.telemetry_cache.get('gps_fix', 0) or 0)
+            if _has_vel_kick and _gps_fix < 3:
+                vx = float(p.get('vx', 0)); vy = float(p.get('vy', 0))
+                vz = float(p.get('vz', 0)); yr = float(p.get('yaw_rate', 0))
+                if self.obstacle_avoidance:
+                    _tof = {k: self.telemetry_cache.get(k, -1) for k in ('t1', 't2', 't3', 't4')}
+                    vx, vy, vz = self.obstacle_avoidance.adjust_velocity_command(
+                        vx, vy, vz, _tof, drone_yaw_rad=self.telemetry_cache.get('yaw', 0))
+                if str(self.telemetry_cache.get('mode_id', '')) not in ('ALT_HOLD', '2'):
+                    self.fc.mav.set_mode_send(self.fc.target_system,
+                        mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 2)  # ALT_HOLD
+                _G = 250.0
+                _clip = lambda v: int(max(1100, min(1900, 1500 + v)))
+                rc1 = _clip( vy * _G); rc2 = _clip(-vx * _G)
+                rc3 = _clip(-vz * _G); rc4 = _clip( yr * _G)
+                self.fc.mav.rc_channels_override_send(
+                    self.fc.target_system, self.fc.target_component,
+                    rc1, rc2, rc3, rc4, 0, 0, 0, 0)
+                print(f"NO-GPS AI FLIGHT (ALT_HOLD RC): R{rc1} P{rc2} T{rc3} Y{rc4} | vx{vx:.2f} vy{vy:.2f} vz{vz:.2f} yr{yr:.2f}")
+                return
+
+            # Ensure FC is in GUIDED mode so it follows our setpoints
+            # (ArduPilot ignores position/velocity targets in STABILIZE/ALT_HOLD).
+            # ONLY when there IS a movement setpoint — this used to run UNCONDITIONALLY, so any
+            # non-numeric payload (a named command, gimbal-only, LED) force-flipped the FC to GUIDED
+            # as a side effect (e.g. mid-LOITER hold, or during manual flight). Now it can't.
+            if has_velocity or has_gps or has_local_pos:
+                current_mode = self.telemetry_cache.get('mode_id', '')
+                if str(current_mode) not in ('GUIDED', '4'):
+                    self.fc.mav.set_mode_send(
+                        self.fc.target_system,
+                        mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                        4  # GUIDED
+                    )
 
             # Yaw handling (works with any mode)
             yaw_deg = float(p.get('yaw', 0))
@@ -536,7 +571,7 @@ class RadxaBridge:
             pass
         return resp
 
-    async def handle_local_client(self, websocket, path):
+    async def handle_local_client(self, websocket, path=None):  # path optional: websockets v11+ omits it
         print("🔗 FAST-LINK: Client Connected (Local)")
         self.local_clients.add(websocket)
         try:
@@ -548,12 +583,31 @@ class RadxaBridge:
                     if 'token' in data:
                         print(f"🤝 FAST-LINK Handshake: {data.get('id')}")
                         continue
+                    # RESTORED (wiped 6-30..7-02): INBOUND logging + the peer relay. Without the
+                    # relay, the app's AI-box jobs (type 'ai_job') never reached the laptop director
+                    # AND the laptop's ai_response/ai_status never reached the app — the whole
+                    # natural-language AI command loop was dead over the local link.
+                    _t = data.get('type')
+                    if _t not in ('joystick', 'telemetry', 'user_gps', 'gimbal'):
+                        _pl = data.get('payload')
+                        _act = _pl.get('action') if isinstance(_pl, dict) else _pl
+                        print(f"INBOUND type={_t} action={_act} payload={str(_pl)[:120]}")
+                    # Relay AI / natural-language jobs to peer clients (laptop_vision director)
+                    if _t in ('ai_job', 'neural', 'neural_command', 'ai', 'nl_command', 'job',
+                              'text_command', 'ai_response', 'ai_status'):
+                        print(f"RELAY ai_job -> {len(self.local_clients)-1} peer(s)")
+                        for c in list(self.local_clients):
+                            if c is not websocket:
+                                try:
+                                    await c.send(message)
+                                except Exception:
+                                    self.local_clients.discard(c)
                     # Process command
                     await self.process_packet(data.get('type'), data.get('payload'))
                 except Exception as e:
                     print(f"⚠️ FAST-LINK Data Error: {e}")
-        except:
-             pass
+        except Exception as e:
+             print(f"🔗 FAST-LINK loop ended: {type(e).__name__}: {e}")
         finally:
              print("🔗 FAST-LINK: Client Disconnected")
              self.local_clients.remove(websocket)
@@ -565,7 +619,7 @@ class RadxaBridge:
         print(f"🔭 ESP32 Gimbal Link Active -> {self.esp32_addr}")
     async def connect_mavlink(self):
         self.init_esp32()
-        asyncio.create_task(self.lidar_loop())
+        # lidar_loop() is started in main asyncio.gather(), NOT here (was causing double-start)
         # V110: Use configured baud rate (57600 for ArduPilot default)
         bauds = [FC_BAUD]
         while self.running:
@@ -583,8 +637,18 @@ class RadxaBridge:
                     self.fc.mav.request_data_stream_send(self.fc.target_system, self.fc.target_component, mavutil.mavlink.MAV_DATA_STREAM_EXTRA1, 4, 1) # Attitude
                     self.fc.mav.request_data_stream_send(self.fc.target_system, self.fc.target_component, mavutil.mavlink.MAV_DATA_STREAM_EXTRA2, 4, 1) # HUD
                     self.fc.mav.request_data_stream_send(self.fc.target_system, self.fc.target_component, mavutil.mavlink.MAV_DATA_STREAM_POSITION, 4, 1) # REL_ALT
+                    self.fc.mav.request_data_stream_send(self.fc.target_system, self.fc.target_component, mavutil.mavlink.MAV_DATA_STREAM_RAW_SENSORS, 4, 1) # RANGEFINDER ground-truth echo (Jul-2 diagnostic, kept)
 
                     self.fc.mav.param_set_send(self.fc.target_system, self.fc.target_component, b'ARMING_CHECK', 0, mavutil.mavlink.MAV_PARAM_TYPE_UINT32)
+                    # RESTORED (wiped 6-30..7-02, orig patch_thr_dz 6-24):
+                    self.fc.mav.param_set_send(self.fc.target_system, self.fc.target_component, b'THR_DZ', 0, mavutil.mavlink.MAV_PARAM_TYPE_INT16)  # no ALT_HOLD throttle deadzone -> small climb cmds climb
+                    self.fc.mav.param_set_send(self.fc.target_system, self.fc.target_component, b'DISARM_DELAY', 0, mavutil.mavlink.MAV_PARAM_TYPE_INT8)  # never auto-disarm mid-sequence
+                    # APP-DRIVEN AUTO MISSIONS (SITL-found 2026-07-12): with default AUTO_OPTIONS,
+                    # a mission in AUTO waits for a PILOT THROTTLE RAISE before the takeoff item —
+                    # an app-flown drone has no throttle stick, so the route missions would sit
+                    # armed and idle forever. Bits: 1=allow arming in AUTO, 2=allow AUTO takeoff
+                    # without raising throttle.
+                    self.fc.mav.param_set_send(self.fc.target_system, self.fc.target_component, b'AUTO_OPTIONS', 3, mavutil.mavlink.MAV_PARAM_TYPE_INT32)
                     self.fc.mav.param_set_send(self.fc.target_system, self.fc.target_component, b'EKF2_GPS_CHECK', 0, mavutil.mavlink.MAV_PARAM_TYPE_UINT32) # V26: Kill EKF GPS Check
                     self.fc.mav.param_set_send(self.fc.target_system, self.fc.target_component, b'FS_EKF_THRESH', 0, mavutil.mavlink.MAV_PARAM_TYPE_UINT32) # V26: Kill EKF Failsafe
 
@@ -620,10 +684,10 @@ class RadxaBridge:
                     self.fc.mav.param_set_send(self.fc.target_system, self.fc.target_component, b'BATT_MONITOR', 4, mavutil.mavlink.MAV_PARAM_TYPE_INT8)
                     self.fc.mav.param_set_send(self.fc.target_system, self.fc.target_component, b'BATT_VOLT_PIN', 2, mavutil.mavlink.MAV_PARAM_TYPE_INT8)
                     self.fc.mav.param_set_send(self.fc.target_system, self.fc.target_component, b'BATT_CURR_PIN', 3, mavutil.mavlink.MAV_PARAM_TYPE_INT8)
-                    self.fc.mav.param_set_send(self.fc.target_system, self.fc.target_component, b'BATT_VOLT_MULT', 10.1, mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
+                    self.fc.mav.param_set_send(self.fc.target_system, self.fc.target_component, b'BATT_VOLT_MULT', 4.4012, mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
                     self.fc.mav.param_set_send(self.fc.target_system, self.fc.target_component, b'BATT_AMP_PERVOLT', 18.0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
-                    # V105: CORRECTION - Capacity 8400mAh (User Specified)
-                    self.fc.mav.param_set_send(self.fc.target_system, self.fc.target_component, b'BATT_CAPACITY', 8400, mavutil.mavlink.MAV_PARAM_TYPE_INT32)
+                    # Battery: 5400mAh 3S 60C LiPo
+                    self.fc.mav.param_set_send(self.fc.target_system, self.fc.target_component, b'BATT_CAPACITY', 5400, mavutil.mavlink.MAV_PARAM_TYPE_INT32)
                     self.fc.mav.param_set_send(self.fc.target_system, self.fc.target_component, b'ANGLE_MAX', 6000, mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
                     self.fc.mav.param_set_send(self.fc.target_system, self.fc.target_component, b'PILOT_SPEED_UP', 500, mavutil.mavlink.MAV_PARAM_TYPE_INT16)
                     self.fc.mav.param_set_send(self.fc.target_system, self.fc.target_component, b'MOT_SPOOL_TIME', 0.0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32) # V72: ZERO DELAY
@@ -634,6 +698,17 @@ class RadxaBridge:
                     self.fc.mav.param_set_send(self.fc.target_system, self.fc.target_component, b'BATT_LOW_VOLT', 9.6, mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
                     self.fc.mav.param_set_send(self.fc.target_system, self.fc.target_component, b'BATT_CRT_VOLT', 9.0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
                     print("🔓 INDOOR MODE: ZERO DELAY (V72) | SMOOTHED BATTERY")
+                    # Seed the movement-envelope (fc_caps) from what we set, then REQUEST the live values so
+                    # PARAM_VALUE refreshes them — so the laptop AI bounds movement by the REAL FC config.
+                    self.telemetry_cache.setdefault('fc_caps', {}).update({
+                        'ANGLE_MAX': 6000.0, 'PILOT_SPEED_UP': 500.0, 'PILOT_SPEED_DN': 150.0,
+                        'WPNAV_SPEED': 1000.0, 'PILOT_ACCEL_Z': 250.0,
+                    })
+                    for _p in (b'ANGLE_MAX', b'WPNAV_SPEED', b'PILOT_SPEED_UP', b'PILOT_SPEED_DN', b'PILOT_ACCEL_Z'):
+                        try:
+                            self.fc.mav.param_request_read_send(self.fc.target_system, self.fc.target_component, _p, -1)
+                        except Exception:
+                            pass
                     return
                 except Exception as e:
                     print(f"⚠️ FC Check Failed: {e}")
@@ -657,16 +732,13 @@ class RadxaBridge:
                     }
                     await ws.send(json.dumps(auth_frame))
 
-                    # START LOCAL GOPRO BLUETOOTH PROXY
-                    # Tries to connect to physical GoPro next to Radxa
+                    # START LOCAL GOPRO BLUETOOTH PROXY (once)
                     if not self.gopro_proxy:
-                        await self.init_gopro_proxy()
+                        asyncio.create_task(self.init_gopro_proxy())
 
-                    # PARALLEL TASKS
-                    await asyncio.gather(
-                        self.telemetry_loop(),
-                        self.command_loop()
-                    )
+                    # Command loop runs inside cloud connection (needs self.ws)
+                    # Telemetry loop runs SEPARATELY in main gather (doesn't need cloud)
+                    await self.command_loop()
                     self.fc.mav.request_data_stream_send(self.fc.target_system, self.fc.target_component, mavutil.mavlink.MAV_DATA_STREAM_RC_CHANNELS, 2, 1) # V27: Debug RC
             except Exception as e:
                 print(f"⚠️ Cloud Disconnected: {e}. Retrying in 5s...")
@@ -674,10 +746,12 @@ class RadxaBridge:
                 await asyncio.sleep(5)
     async def telemetry_loop(self):
         last_send = 0
-        while self.ws and self.running:
+        telem_count = 0
+        while self.running:  # Don't depend on self.ws — telemetry must flow even if cloud is down
             if self.fc:
                 # V22: Drain Buffer (Process up to 50 msgs per loop to catch ACKs)
-                for _ in range(50):
+                try:
+                  for _ in range(50):
                     msg = self.fc.recv_match(blocking=False)
                     if not msg: break
 
@@ -692,10 +766,35 @@ class RadxaBridge:
                              calc_pct = int((batt_voltage - 9.0) / 3.6 * 100.0)
                              batt_pct = max(0, min(100, calc_pct))
 
-                        # V72: REAL-TIME (No Smoothing - User wants accurate readings)
-                        self.telemetry_cache['battery'] = batt_pct # Direct, unfiltered
+                        # Real LiPo 3S discharge curve (per-cell voltage → %)
+                        cell_v = batt_voltage / 3.0
+                        # Measured LiPo discharge curve lookup (voltage per cell → capacity %)
+                        LIPO_CURVE = [
+                            (4.20, 100), (4.15, 95), (4.11, 90), (4.08, 85),
+                            (4.02, 80), (3.98, 75), (3.95, 70), (3.91, 65),
+                            (3.87, 60), (3.85, 55), (3.84, 50), (3.82, 45),
+                            (3.80, 40), (3.79, 35), (3.77, 30), (3.75, 25),
+                            (3.73, 20), (3.71, 15), (3.69, 10), (3.61, 5),
+                            (3.27, 0),
+                        ]
+                        if cell_v >= 4.20:
+                            batt_pct = 100
+                        elif cell_v <= 3.27:
+                            batt_pct = 0
+                        else:
+                            for i in range(len(LIPO_CURVE) - 1):
+                                v_hi, p_hi = LIPO_CURVE[i]
+                                v_lo, p_lo = LIPO_CURVE[i + 1]
+                                if v_lo <= cell_v <= v_hi:
+                                    batt_pct = int(p_lo + (cell_v - v_lo) / (v_hi - v_lo) * (p_hi - p_lo))
+                                    break
+                        self.telemetry_cache['battery'] = batt_pct
+                        self.telemetry_cache['cell_voltage'] = round(cell_v, 2)
                         self.telemetry_cache['voltage'] = batt_voltage
-                        self.telemetry_cache['armed'] = (msg.onboard_control_sensors_health & mavutil.mavlink.MAV_SYS_STATUS_SENSOR_3D_GYRO) # Approximation or use HEARTBEAT
+                        # V133_REAL_ARMED (restored — was wiped): 'armed' now comes from
+                        # HEARTBEAT.base_mode (the REAL arm state) in the HEARTBEAT handler below.
+                        # The old gyro-health bit was ALWAYS 1, so the laptop "dreamed" liftoff
+                        # while the motors never moved.
 
                         # V26: Capture Mode
                         self.telemetry_cache['mode_id'] = self.fc.flightmode
@@ -704,7 +803,13 @@ class RadxaBridge:
                             print(f"LOW BATT < {self.batt_threshold}%! Smart RTH -> {self.batt_rth_destination}")
                             self.low_batt_triggered = True
                             self.follow_me_active = False  # Stop follow on low batt
-                            if self.batt_rth_destination == 'user' and self.user_gps:
+                            # RESTORED (wiped): GPS gate — low-batt return without a 3D fix is a
+                            # blind RTL -> LAND in place instead (safe, indoors-correct).
+                            _fix = int(self.telemetry_cache.get('gps_fix', 0) or 0)
+                            if _fix < 3:
+                                print(f"LOW BATT: no GPS (fix={_fix}) — LANDING IN PLACE (safe, no blind RTL)")
+                                self.fc.mav.set_mode_send(self.fc.target_system, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 9)
+                            elif self.batt_rth_destination == 'user' and self.user_gps:
                                 lat, lng = self.user_gps
                                 print(f"RTH to User: {lat}, {lng}")
                                 self.fc.mav.set_mode_send(self.fc.target_system, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 4)
@@ -715,9 +820,75 @@ class RadxaBridge:
 
                     elif type == 'STATUSTEXT': # V23: The Voice of the FC
                          print(f"📢 FC SAYS: {msg.text}")
+                         # V131: Push FC text messages (AutoTune Success/Failed, arming errors, etc.)
+                         # live to the laptop over the SAME Tailscale local_clients broadcast used for
+                         # telemetry — so you see it on the laptop with no wire/telemetry radio needed.
+                         if self.local_clients:
+                             status_msg = json.dumps({
+                                 "type": "fc_status_text",
+                                 "payload": {"text": msg.text, "severity": int(msg.severity), "ts": time.time()}
+                             })
+                             for c in list(self.local_clients):
+                                 try:
+                                     await asyncio.wait_for(c.send(status_msg), timeout=2.0)
+                                 except Exception:
+                                     pass
 
-                    elif type == 'PARAM_VALUE': # V23: TX Verification
-                         print(f"✅ TX VERIFIED: Read Param {msg.param_id} = {msg.param_value}")
+                    elif type == 'HEARTBEAT':
+                        # V133_REAL_ARMED (restored): TRUE armed state (motors hot) straight from the FC.
+                        self.telemetry_cache['armed'] = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+
+                    elif type == 'PARAM_VALUE': # V23: TX Verification + live FC capability envelope
+                         _pid = msg.param_id
+                         if not isinstance(_pid, str):
+                             try: _pid = _pid.decode('utf-8', 'ignore')
+                             except Exception: _pid = str(_pid)
+                         _pid = _pid.strip('\x00 ')
+                         # Forward the movement-envelope params to the laptop as fc_caps so the AI's movement
+                         # is bounded by what THIS airframe is ACTUALLY configured for (live, not hardcoded).
+                         if _pid in ('ANGLE_MAX', 'WPNAV_SPEED', 'PILOT_SPEED_UP', 'PILOT_SPEED_DN',
+                                     'PILOT_ACCEL_Z', 'WPNAV_ACCEL', 'ATC_SLEW_YAW'):
+                             self.telemetry_cache.setdefault('fc_caps', {})[_pid] = float(msg.param_value)
+                             print(f"⚙️ fc_caps {_pid} = {msg.param_value}")
+                         else:
+                             print(f"✅ TX VERIFIED: Read Param {_pid} = {msg.param_value}")  # V23 (kept)
+                    elif type in ('MISSION_REQUEST', 'MISSION_REQUEST_INT'):
+                         # PROPER mission-upload handshake (the old cloud path blind-blasted items;
+                         # ArduPilot pulls them by seq — answer each request from the pending list).
+                         _pm = getattr(self, '_pending_mission', None)
+                         if _pm and 0 <= msg.seq < len(_pm):
+                             it = _pm[msg.seq]
+                             self.fc.mav.mission_item_int_send(
+                                 self.fc.target_system, self.fc.target_component, msg.seq,
+                                 mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+                                 it['cmd'], 0, 1, 0, 0, 0, 0,
+                                 int(it['lat'] * 1e7), int(it['lng'] * 1e7), float(it['alt']))
+                    elif type == 'MISSION_ACK':
+                         _pm = getattr(self, '_pending_mission', None)
+                         if _pm:
+                             _n = len(_pm) - 2
+                             print(f"🗺️ MISSION_ACK type={msg.type} — {_n} waypoints on the FC")
+                             self._pending_mission = None
+                             _msg = {"type": "alert", "payload": {
+                                 "msg": f"MISSION UPLOADED ({_n} waypoints)" if msg.type == 0 else
+                                        f"MISSION REJECTED by FC (MAV_MISSION result {msg.type})",
+                                 "level": "info" if msg.type == 0 else "error"}}
+                             for c in list(self.local_clients):
+                                 try: await c.send(json.dumps(_msg))
+                                 except Exception: pass
+                             if msg.type == 0 and getattr(self, '_mission_autostart', False):
+                                 self._mission_autostart = False
+                                 if self.is_armed:
+                                     print("🗺️ Mission accepted + ARMED -> switching AUTO (mission flies)")
+                                     self.fc.mav.set_mode_send(self.fc.target_system,
+                                         mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 3)
+                                 else:
+                                     print("🗺️ Mission accepted (DISARMED) — ARM then switch AUTO to fly it")
+                    elif type == 'WIND':
+                         # ArduPilot EKF 2D wind estimate — the AI shows it (info); the FC's mode does the
+                         # actual wind rejection (GUIDED/Loiter/PosHold with GPS).
+                         self.telemetry_cache['wind_dir'] = getattr(msg, 'direction', None)
+                         self.telemetry_cache['wind_speed'] = getattr(msg, 'speed', None)
                     elif type == 'ATTITUDE':
                          self.telemetry_cache['roll'] = msg.roll
                          self.telemetry_cache['pitch'] = msg.pitch
@@ -744,6 +915,21 @@ class RadxaBridge:
                          # V110: Satellite count + GPS fix quality
                          self.telemetry_cache['sats'] = msg.satellites_visible
                          self.telemetry_cache['gps_fix'] = msg.fix_type  # 0=no, 2=2D, 3=3D
+                         # Jul-2 diagnostic (kept): periodic human-readable GPS status in the journal —
+                         # essential for the new-GPS outdoor bench test (watch fix go NO_FIX->3D_FIX).
+                         self._dbg_gps_count = getattr(self, '_dbg_gps_count', 0) + 1
+                         if self._dbg_gps_count % 10 == 1:
+                             _fixnames = {0: "NO_GPS", 1: "NO_FIX", 2: "2D_FIX", 3: "3D_FIX", 4: "DGPS", 5: "RTK_FLOAT", 6: "RTK_FIXED"}
+                             print(f"🛰️ GPS STATUS: fix={_fixnames.get(msg.fix_type, msg.fix_type)} sats={msg.satellites_visible} hdop={msg.eph/100.0 if msg.eph!=65535 else 'N/A'}")
+
+                    elif type == 'RANGEFINDER':
+                         # Jul-2 diagnostic (kept): the FC ECHOES its internal rangefinder value — proves
+                         # whether the FC is INGESTING our LiDAR DISTANCE_SENSOR (the rangefinder1 check
+                         # without Mission Planner).
+                         print(f"🎯 FC RANGEFINDER ECHO: distance={msg.distance}m voltage={msg.voltage}")
+
+                    elif type == 'DISTANCE_SENSOR':
+                         print(f"🎯 FC DISTANCE_SENSOR ECHO: current_distance={msg.current_distance}cm id={msg.id} orient={msg.orientation}")
 
                     elif type == 'VFR_HUD':
                          # V110: Airspeed, groundspeed, altitude, climb rate
@@ -780,6 +966,9 @@ class RadxaBridge:
                         a = math.sin(dlat/2)**2 + math.cos(math.radians(self.home_lat)) * math.cos(math.radians(lat)) * math.sin(dlng/2)**2
                         c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
                         self.telemetry_cache['distance'] = round(6371000 * c, 1)  # meters
+                except Exception:
+                    await asyncio.sleep(2)
+                    continue
             now = time.time()
             # P3.0: LiDAR data is injected by lidar_loop() directly into telemetry_cache
             # P3.1: Inject safety status into telemetry
@@ -806,17 +995,38 @@ class RadxaBridge:
                     )
             if self.telemetry_cache:
                 if now - last_send > 0.1: # 10Hz
-                    msg = json.dumps({"type": "telemetry", "payload": self.telemetry_cache})
-                    if self.ws: await self.ws.send(msg)
-                    # P2.6: Broadcast to Local AI Clients
-                    if self.local_clients:
-                        dead = set()
-                        for c in self.local_clients:
-                            try: await c.send(msg)
-                            except: dead.add(c)
-                        self.local_clients -= dead
+                    try:
+                        msg = json.dumps({"type": "telemetry", "payload": self.telemetry_cache})
+                        telem_count += 1
+                        sent_to = []
+                        if self.ws:
+                            try:
+                                await asyncio.wait_for(self.ws.send(msg), timeout=2.0)
+                                sent_to.append("cloud")
+                            except Exception as e:
+                                if telem_count % 50 == 0:  # Don't spam
+                                    print(f"⚠️ Cloud telem send failed: {e}")
+                        # P2.6: Broadcast to Local AI Clients (Tailscale direct)
+                        if self.local_clients:
+                            dead = set()
+                            for c in self.local_clients:
+                                try:
+                                    await asyncio.wait_for(c.send(msg), timeout=5.0)
+                                    sent_to.append("local")
+                                except asyncio.TimeoutError:
+                                    sent_to.append("local-slow")  # slow phone over Tailscale — KEEP it, don't drop
+                                except Exception:
+                                    dead.add(c)  # connection genuinely closed
+                            self.local_clients -= dead
+                    except Exception as e:
+                        print(f"⚠️ Telemetry broadcast error: {e}")
                     last_send = now
-                # DASHBOARD LOGGING (Every 1s - scrolling)
+                    # Diagnostic: show telemetry is flowing (every 5 seconds)
+                    if telem_count % 50 == 1:
+                        batt = self.telemetry_cache.get('battery', '?')
+                        alt = self.telemetry_cache.get('altitude', '?')
+                        print(f"📡 TELEM #{telem_count} → {sent_to} | Batt={batt}% Alt={alt}m")
+                # DASHBOARD LOGGING (Every 2s)
                 if int(now) % 2 == 0 and int(now) != getattr(self, 'last_log_sec', 0):
                     self.last_log_sec = int(now)
                     alt = self.telemetry_cache.get('altitude', 0)
@@ -826,26 +1036,341 @@ class RadxaBridge:
                     sats = self.telemetry_cache.get('sats', 0)
                     raw = self.telemetry_cache.get('raw_alt', 0)
                     is_armed = self.fc.motors_armed() if self.fc else False
+                    # Notify ESP32 when armed state changes (LED sync)
+                    if is_armed != self.is_armed:
+                        try:
+                            self.esp32_cmd_queue.put_nowait({"armed": is_armed})
+                        except: pass
                     self.is_armed = is_armed # V107: Update state
                     mode = self.telemetry_cache.get('mode_id', 'UNK')
-                    est_cells = int(round(volt / 4.2)) if volt > 0 else 0 # V26: Battery Debug
+                    est_cells = 3  # Hardcoded: 3S 5400mAh LiPo (auto-detect unreliable at low voltage)
                     speed = self.telemetry_cache.get('speed', 0)
                      # PRINT NEWLINE logs for debugging
                     print(f"📊 DATA: Alt={alt:.1f}m (Raw={raw:.1f}) | Batt={batt}% ({volt:.1f}V~{est_cells}S) | Mode={mode} | Spd={speed:.1f} | Armed={is_armed}")
 
 
 
-                    # V28: WAR ON RTL - Force Stabilize every 1s if disarmed
-                    # V64: Force STABILIZE (0) - Instant Response
-                    if not is_armed and mode != 'STABILIZE' and int(now) % 2 == 0:
-                        self.fc.mav.set_mode_send(self.fc.target_system, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 0) # STABILIZE
-                        print("🛡️ FORCING STABILIZE (0) - INSTANT ADAPTIVE")
+                    # Force STABILIZE when disarmed (every 10s, not every 2s)
+                    if not is_armed and mode != 'STABILIZE' and int(now) % 10 == 0 and int(now) != getattr(self, '_last_stab_force', 0):
+                        self._last_stab_force = int(now)
+                        self.fc.mav.set_mode_send(self.fc.target_system, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 0)
+                        self._auto_armed_done = False  # Reset auto-arm flag when disarmed
 
             await asyncio.sleep(0.01)
+    async def _land_backstop_disarm(self):
+        # RESTORED (wiped 6-30..7-02). After the LAND descent window, force-disarm so motors ALWAYS
+        # stop (belt-and-suspenders, in case the landing detector doesn't fire). A redundant disarm
+        # on the ground is harmless.
+        await asyncio.sleep(15.0)
+        if self.fc:
+            for _ in range(5):
+                self.fc.mav.command_long_send(self.fc.target_system, self.fc.target_component,
+                                              mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                                              0, 0, 21196, 0, 0, 0, 0, 0)
+            print("LAND backstop: force-disarm after descent window")
+
+    async def _goto_then_land(self, delay_s=10.0):
+        # RESTORED (wiped 6-30..7-02). LAND "return to user": after the goto window, switch to LAND
+        # so the drone descends at the user. ArduPilot's landing detector disarms on touchdown.
+        await asyncio.sleep(delay_s)
+        if self.fc:
+            self.fc.mav.set_mode_send(self.fc.target_system,
+                                      mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 9)
+            print("LAND(user): goto window elapsed -> LAND mode for descent")
+
+    async def _execute_named_command(self, cmd, cmd_payload=None):
+        """Execute a NAMED flight command over the LOCAL link with the SAME MAVLink actions the cloud
+        command_loop uses (LAND smart-disarm, RTL/RTH incl. batt_rth_destination, RETURN_TO_USER,
+        ARM split-arm, DISARM force, TAKEOFF, bare mode names). Returns True if the command was handled
+        (caller then does NOT fall through to execute_ai_plan). Keep in sync with command_loop."""
+        p = cmd_payload if isinstance(cmd_payload, dict) else {}
+        if not self.fc:
+            print(f"⚠️ NAMED CMD {cmd}: no FC connection")
+            return cmd in ('LAND', 'TAKEOFF', 'ARM', 'DISARM', 'RTL', 'RTH',
+                           'RETURN_TO_USER', 'RTH_USER', 'RETURN_USER',
+                           'STABILIZE', 'ALT_HOLD', 'LOITER', 'POSHOLD', 'GUIDED', 'AUTO')
+
+        if cmd == 'LAND':
+            alt = self.telemetry_cache.get('altitude', 0)
+            print(f"🛬 LAND CMD (local). Alt={alt:.1f}m")
+            # RESTORED (wiped): 16s cmd_vel lockout so the laptop stream can't fight the landing,
+            # + guaranteed disarm backstop after the descent window.
+            self._cmd_lock_until = time.time() + 16.0
+            if alt < 1.0:
+                print("🛑 GROUND: FORCE DISARM (21196)")
+                self.fc.mav.command_long_send(self.fc.target_system, self.fc.target_component,
+                                              mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                                              0, 0, 21196, 0, 0, 0, 0, 0)
+            else:
+                self.fc.mav.command_long_send(self.fc.target_system, self.fc.target_component,
+                                              mavutil.mavlink.MAV_CMD_NAV_LAND, 0, 0, 0, 0, 0, 0, 0, 0)
+                asyncio.create_task(self._smart_avoidance_monitor('land'))
+                asyncio.create_task(self._land_backstop_disarm())
+            return True
+
+        if cmd == 'TAKEOFF':
+            # SITL-FOUND (2026-07-08): NAV_TAKEOFF is only valid in GUIDED — and right after boot
+            # the EKF origin can lag the GPS fix by several seconds, so the GUIDED switch itself
+            # gets DENIED ("requires position"). Absorb the race here: keep re-requesting GUIDED
+            # until the FC actually reports it (EKF ready), THEN command the climb.
+            alt = float(p.get('alt', 5))
+            for _ in range(24):                                   # up to ~12s of EKF settling
+                self.fc.mav.set_mode_send(self.fc.target_system,
+                                          mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 4)
+                await asyncio.sleep(0.5)
+                if str(self.telemetry_cache.get('mode_id', '')) in ('GUIDED', '4'):
+                    break
+            else:
+                print("🛫 TAKEOFF: FC never accepted GUIDED (EKF position not ready?) — sending anyway")
+            self.fc.mav.command_long_send(self.fc.target_system, self.fc.target_component,
+                                          mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 0, 0, 0, 0, 0, alt)
+            return True
+
+        if cmd == 'ARM':
+            self.fc.mav.set_mode_send(self.fc.target_system,
+                                      mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 0)  # STABILIZE
+            print("🛡️ SPLIT-ARM (local): Mode -> STABILIZE... then ARM")
+            self.fc.mav.command_long_send(self.fc.target_system, self.fc.target_component,
+                                          mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                                          0, 1, 0, 0, 0, 0, 0, 0)
+            return True
+
+        if cmd == 'DISARM':
+            # RESTORED (wiped): KILL semantics — 5x force-disarm + 8s cmd_vel lockout so the
+            # laptop throttle stream cannot re-spin the motors.
+            self._cmd_lock_until = time.time() + 8.0
+            for _ in range(5):
+                self.fc.mav.command_long_send(self.fc.target_system, self.fc.target_component,
+                                              mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                                              0, 0, 21196, 0, 0, 0, 0, 0)
+            print("LOCAL DISARM: FORCE DISARM x5 + 8s cmd lockout")
+            return True
+
+        if cmd in ('RTL', 'RTH'):
+            # RESTORED (wiped): GPS gate — RTL without a 3D fix is a BLIND return (the FC doesn't
+            # know where home is) -> LAND in place instead.
+            _fix = int(self.telemetry_cache.get('gps_fix', 0) or 0)
+            if _fix < 3:
+                print(f"🏠 RTH: no GPS (fix={_fix}) — LANDING IN PLACE (safe, no blind RTL)")
+                self._cmd_lock_until = time.time() + 16.0
+                self.fc.mav.set_mode_send(self.fc.target_system,
+                                          mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 9)
+                asyncio.create_task(self._land_backstop_disarm())
+            elif self.batt_rth_destination == 'user' and self.user_gps:
+                lat, lng = self.user_gps
+                print(f"🏠 RTH TO USER (local): ({lat:.6f}, {lng:.6f})")
+                self.fc.mav.set_mode_send(self.fc.target_system,
+                                          mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 4)
+                self.fc.mav.mission_item_int_send(
+                    self.fc.target_system, self.fc.target_component,
+                    0, mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+                    mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, 2, 0, 0, 0, 0, 0,
+                    int(lat * 1e7), int(lng * 1e7), 15)
+            else:
+                print("🏠 RTH TO LAUNCH (local RTL)")
+                self.fc.set_mode('RTL')
+            asyncio.create_task(self._smart_avoidance_monitor('rth'))
+            return True
+
+        if cmd in ('RETURN_TO_USER', 'RTH_USER', 'RETURN_USER'):
+            # Explicit user return: coords from the payload (laptop sends lat/lng) or live user_gps.
+            # GPS gate: navigating to the user needs the DRONE's own 3D fix — without one the goto
+            # (and a blind RTL) can't navigate -> LAND in place instead.
+            _fix = int(self.telemetry_cache.get('gps_fix', 0) or 0)
+            lat = p.get('lat'); lng = p.get('lng')
+            if lat is None and self.user_gps:
+                lat, lng = self.user_gps
+            if _fix < 3:
+                print(f"🏠 RETURN TO USER: no GPS (fix={_fix}) — LANDING IN PLACE (safe)")
+                self._cmd_lock_until = time.time() + 16.0
+                self.fc.mav.set_mode_send(self.fc.target_system,
+                                          mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 9)
+                asyncio.create_task(self._land_backstop_disarm())
+            elif lat is not None:
+                alt = float(p.get('alt', 15))
+                print(f"🏠 RETURN TO USER (local): ({float(lat):.6f}, {float(lng):.6f}) @ {alt}m")
+                self.fc.mav.set_mode_send(self.fc.target_system,
+                                          mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 4)
+                self.fc.mav.mission_item_int_send(
+                    self.fc.target_system, self.fc.target_component,
+                    0, mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+                    mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, 2, 0, 0, 0, 0, 0,
+                    int(float(lat) * 1e7), int(float(lng) * 1e7), alt)
+                asyncio.create_task(self._smart_avoidance_monitor('rth'))
+            else:
+                print("🏠 RETURN TO USER: no user location — RTL (drone has GPS fix)")
+                self.fc.set_mode('RTL')
+            return True
+
+        if cmd in ('STABILIZE', 'ALT_HOLD', 'LOITER', 'POSHOLD', 'GUIDED', 'AUTO'):
+            mode_map = {'STABILIZE': 0, 'ALT_HOLD': 2, 'AUTO': 3,
+                        'GUIDED': 4, 'LOITER': 5, 'POSHOLD': 16}
+            print(f"🛩️ MODE (local): {cmd}")
+            self.fc.mav.set_mode_send(self.fc.target_system,
+                                      mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, mode_map[cmd])
+            return True
+
+        if cmd == 'SET_SPEED':
+            # Cinematic speed change (m/s) -> the FC's real WPNAV_SPEED param (cm/s). Was previously
+            # UNHANDLED anywhere (silent no-op). The FC echoes PARAM_VALUE -> fc_caps -> the laptop's
+            # movement envelope updates automatically, so the AI's speed ceiling follows it live.
+            try:
+                ms = float(p.get('value', 5.0))
+                cms = max(50, min(2000, int(ms * 100)))
+                print(f"🎬 SET_SPEED (local): {ms} m/s -> WPNAV_SPEED={cms}")
+                self.fc.mav.param_set_send(self.fc.target_system, self.fc.target_component,
+                                           b'WPNAV_SPEED', float(cms),
+                                           mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
+            except Exception as e:
+                print(f"⚠️ SET_SPEED failed: {e}")
+            return True
+
+        return False   # not a named command -> caller falls through to execute_ai_plan
+
+    async def process_packet(self, type, payload):
+        """Process a command from local WebSocket client (Tailscale/laptop AI).
+           Routes into the same logic as command_loop but without needing cloud WS."""
+        if not type:
+            return
+
+        # user_gps from app via Tailscale
+        if type == 'user_gps':
+            if payload and isinstance(payload, dict) and 'lat' in payload:
+                self.user_gps = (payload.get('lat'), payload.get('lng'))
+            return
+
+        # joystick from app via Tailscale
+        if type == 'joystick':
+            if not isinstance(payload, dict):
+                return
+            try:
+                def map_ch(val, center=True):
+                    if center: return int(1500 + (val * 500))
+                    return int(1000 + (val * 1000))
+
+                raw_roll  = float(payload.get('x', 0))
+                raw_pitch = float(payload.get('y', 0))
+                raw_thr   = float(payload.get('z', 0))
+                raw_yaw   = float(payload.get('r', 0))
+
+                rc1 = map_ch(raw_roll)
+                rc2 = map_ch(raw_pitch)
+                rc3 = map_ch(raw_thr)
+                rc4 = map_ch(raw_yaw)
+
+                if self.fc:
+                    self.fc.mav.rc_channels_override_send(
+                        self.fc.target_system, self.fc.target_component,
+                        rc1, rc2, rc3, rc4, 0, 0, 0, 0
+                    )
+            except Exception as e:
+                print(f"⚠️ LOCAL joystick error: {e}")
+            return
+
+        # gimbal from laptop AI via Tailscale
+        if type == 'gimbal':
+            if isinstance(payload, dict):
+                try:
+                    self.esp32_cmd_queue.put_nowait({
+                        "type": "gimbal",
+                        "pitch": payload.get('pitch', 0),
+                        "yaw": payload.get('yaw', 0)
+                    })
+                except: pass
+            return
+
+        # AI velocity commands from laptop AI.
+        # RESTORED (wiped 6-30..7-02): the laptop's AutopilotController sends type='cmd_vel' (NOT
+        # 'velocity') — with only 'velocity' accepted, the ENTIRE autonomous-flight velocity stream
+        # was silently ignored on the local link. Accept BOTH, honour the LAND/DISARM kill-lockout,
+        # and route through execute_ai_plan so the no-GPS ALT_HOLD RC-override conversion (restored
+        # there) applies — that conversion is what made the 6-24 indoor flight work.
+        if type in ('velocity', 'cmd_vel'):
+            if time.time() < getattr(self, '_cmd_lock_until', 0):
+                return   # LAND/DISARM kill-lockout: ignore the laptop throttle stream
+            if isinstance(payload, dict) and self.fc:
+                try:
+                    await self.execute_ai_plan({'action': 'CMD_VEL', 'params': {
+                        'vx': float(payload.get('vx', 0)),
+                        'vy': float(payload.get('vy', 0)),
+                        'vz': float(payload.get('vz', 0)),
+                        'yaw_rate': float(payload.get('yaw_rate', 0)),
+                    }})
+                except Exception as e:
+                    print(f"⚠️ LOCAL velocity error: {e}")
+            return
+
+        # AI plan from laptop AI
+        if type == 'ai_plan' or type == 'AI_PLAN':
+            if isinstance(payload, dict):
+                await self.execute_ai_plan(payload)
+            return
+
+        # Generic commands (LAND, ARM, RTH, etc.)
+        if type == 'command':
+            cmd = payload if isinstance(payload, str) else (payload.get('command', '') if isinstance(payload, dict) else '')
+            cmd_payload = payload.get('payload', {}) if isinstance(payload, dict) and not isinstance(payload, str) else {}
+            if isinstance(cmd, str) and cmd:
+                cmd = cmd.upper().strip()
+                # Safety check
+                is_emergency = cmd in ['LAND', 'DISARM', 'RTL', 'UPDATE_CONFIG']
+                if not is_emergency and not self.safety.validate_auto_action(cmd):
+                    print(f"🛑 SAFETY BLOCK (local): {cmd}")
+                    return
+                # NAMED flight commands (LAND/RTL/ARM/mode names/...) get REAL execution here.
+                # Previously they ALL fell into execute_ai_plan, which only understands numeric
+                # setpoints (vx/vy, lat/lng, mode key) -> every named command over the LOCAL link
+                # (laptop AI + app on Tailscale) was a SILENT NO-OP (only the cloud path executed them).
+                if await self._execute_named_command(cmd, cmd_payload):
+                    return
+                # Not a named command -> AI plan executor (numeric setpoints) as before
+                await self.execute_ai_plan({'action': cmd, **cmd_payload})
+            return
+
+        # Director intent from laptop AI
+        # APP ROUTE MISSION over the LOCAL link (was: silently dropped as 'unknown type'!).
+        # The app sends {"type":"mission","payload":[{lat,lng},...]} with NO start command and NO
+        # altitudes — so: prepend home+TAKEOFF items, upload via the proper MISSION_REQUEST/ACK
+        # handshake (read-loop answers each seq), and auto-start AUTO on ACK if already armed.
+        if type == 'mission':
+            items = payload if isinstance(payload, list) else (payload or {}).get('items', [])
+            items = [it for it in items if isinstance(it, dict) and 'lat' in it and 'lng' in it]
+            if items and self.fc:
+                alt = float(os.getenv('MISSION_ALT_M', '15'))
+                first = items[0]
+                pm = [{'cmd': mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,          # seq0 = home placeholder
+                       'lat': first['lat'], 'lng': first['lng'], 'alt': 0},
+                      {'cmd': mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,           # seq1 = auto-takeoff
+                       'lat': first['lat'], 'lng': first['lng'], 'alt': alt}]
+                pm += [{'cmd': mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+                        'lat': it['lat'], 'lng': it['lng'], 'alt': alt} for it in items]
+                self._pending_mission = pm
+                self._mission_autostart = True
+                # NO separate mission_clear_all: its own MISSION_ACK arrives FIRST and would be
+                # mistaken for upload-complete (SITL-caught: 'Mission upload timeout' + AUTO 'init
+                # failed'). A new mission_count transaction replaces the old mission by itself.
+                self.fc.mav.mission_count_send(self.fc.target_system, self.fc.target_component, len(pm))
+                print(f"🗺️ ROUTE MISSION from app: {len(items)} waypoints @ {alt}m "
+                      f"(+takeoff item) — handshake upload started")
+            return
+
+        if type == 'director_intent':
+            print(f"🎬 LOCAL Director Intent: {str(payload)[:80]}")
+            # Forward to cloud if connected
+            if self.ws:
+                try:
+                    await self.ws.send(json.dumps({"type": "director_intent", "payload": payload}))
+                except: pass
+            return
+
+        # Fallback: try to route as command
+        print(f"⚠️ LOCAL unknown type: {type}")
+
     async def command_loop(self):
         while self.running and self.ws:
             try:
                 msg = await self.ws.recv()
+                self.last_cloud_msg = time.time()  # Update watchdog timer
                 # V57: RAW DEBUG (See exact JSON)
                 if 'joystick' not in msg:
                      print(f"🔍 RAW JSON: {msg}")
@@ -963,7 +1488,21 @@ class RadxaBridge:
                 # P2.1: SETTINGS SYNC
                 if cmd == 'UPDATE_CONFIG':
                     cfg = payload.get('config', {})
-                    print(f"⚙️ SETTINGS UPDATED: {cfg}")
+                    print(f"⚙️ SETTINGS UPDATED: {cfg}")  # V120_SETTINGS_WIRED (restored — was wiped)
+                    # Connect the app's Return/Land/Battery settings to the actual return logic.
+                    if 'rth_behavior' in cfg:
+                        self.batt_rth_destination = 'user' if str(cfg['rth_behavior']).lower() == 'user' else 'launch'
+                        print(f"⚙️ RTH DEST -> {self.batt_rth_destination}")
+                    if 'land_behavior' in cfg:
+                        self.land_destination = 'user' if str(cfg['land_behavior']).lower() == 'user' else 'here'
+                        print(f"⚙️ LAND DEST -> {self.land_destination}")
+                    if 'batt_threshold' in cfg:
+                        try:
+                            self.batt_threshold = max(5, min(50, int(float(cfg['batt_threshold']))))
+                            self.low_batt_triggered = False
+                            print(f"⚙️ BATT THRESHOLD -> {self.batt_threshold}%")
+                        except Exception:
+                            pass
 
                     # HANDLE CAMERA RESOLUTION CHANGE
                     if 'cap_res' in cfg:
@@ -1293,38 +1832,38 @@ class RadxaBridge:
                         # V34: TOY MODE (Auto-Arm on Throttle) BEFORE CLAMPING CHECK
                         # (Logic handled by 'is_armed' check above)
 
-                        if not is_armed:
-                            if rc3 > 1400: # Adjusted for new curve (approx 30% up)
+                        # Auto-arm: only if NOT armed AND not already attempted recently
+                        # BENCH SAFETY: ALLOW_AUTO_ARM gate prevents any auto-arm (props can't spin)
+                        if ALLOW_AUTO_ARM and not is_armed and not getattr(self, '_auto_armed_done', False):
+                            if rc3 > 1400:
                                  self.auto_arm_counter = getattr(self, 'auto_arm_counter', 0) + 1
-
-                                 # Lie to FC (Send Zero) so it accepts Arming
                                  real_rc3 = rc3
-                                 rc3 = 1000
+                                 rc3 = 1000  # Zero throttle for arming
 
-                                 if self.auto_arm_counter > 10: # ~1s hold
-                                      # MA-2 FIX: Set safe flight mode BEFORE arming
-                                      # Use LOITER if GPS available (mode 5), else ALT_HOLD (mode 2)
+                                 if self.auto_arm_counter > 10:
                                       gps_sats = self.telemetry_cache.get('satellites', 0)
                                       if gps_sats >= 6:
-                                          self.fc.mav.set_mode_send(self.fc.target_system, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 5)  # LOITER
-                                          print("🚀 AUTO-ARM: Setting LOITER mode (GPS locked)...")
+                                          self.fc.mav.set_mode_send(self.fc.target_system, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 5)
+                                          print("🚀 AUTO-ARM: LOITER mode (GPS)")
                                       else:
-                                          self.fc.mav.set_mode_send(self.fc.target_system, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 2)  # ALT_HOLD
-                                          print("🚀 AUTO-ARM: Setting ALT_HOLD mode (no GPS)...")
-                                      import asyncio
-                                      # Small delay for mode to take effect
+                                          self.fc.mav.set_mode_send(self.fc.target_system, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 2)
+                                          print("🚀 AUTO-ARM: ALT_HOLD mode")
                                       self.fc.mav.command_long_send(self.fc.target_system, self.fc.target_component, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 1, 0, 0, 0, 0, 0, 0)
                                       print("🚀 AUTO-ARM: Armed!")
                                       self.auto_arm_counter = 0
+                                      self._auto_armed_done = True  # Don't re-arm again
                             else:
                                  self.auto_arm_counter = 0
+                        elif is_armed:
+                            self._auto_armed_done = True  # Already armed (by manual command)
                         self.fc.mav.rc_channels_override_send(
                             self.fc.target_system, self.fc.target_component,
                             rc1, rc2, rc3, rc4, 65535, 65535, 65535, 65535
                         )
 
                         # V31: STICK ARMING LOGIC (Backup - Down-Right)
-                        if rc3 < 1150 and rc4 > 1900:
+                        # BENCH SAFETY: gated behind ALLOW_AUTO_ARM (props can't spin)
+                        if ALLOW_AUTO_ARM and rc3 < 1150 and rc4 > 1900:
                              self.stick_arm_counter = getattr(self, 'stick_arm_counter', 0) + 1
                              if self.stick_arm_counter > 20: # ~2 seconds @ 10Hz
                                   print("🕹️ STICK ARM TRIGGERED!")
@@ -1346,6 +1885,22 @@ class RadxaBridge:
         """V110: Try connecting to GoPro via WiFi UDP or USB"""
         import cv2
         import subprocess
+
+        # Try 0: MediaMTX re-served GoPro feed (rtsp://127.0.0.1:8554/gopro) — the working path for the app /snapshot
+        try:
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+            cap = cv2.VideoCapture("rtsp://127.0.0.1:8554/gopro", cv2.CAP_FFMPEG)
+            if cap.isOpened():
+                ret, f = cap.read()
+                if ret and f is not None:
+                    self.external_cap = cap
+                    self.external_available = True
+                    self.telemetry_cache['external_available'] = True
+                    print(f"✅ EXTERNAL (GoPro via MediaMTX): ACTIVE @ {f.shape[1]}x{f.shape[0]}")
+                    return True
+                cap.release()
+        except Exception as e:
+            print(f"⚠️ MediaMTX RTSP capture failed: {e}")
 
         # Try 1: GoPro USB webcam
         for idx in range(10):
@@ -1370,19 +1925,21 @@ class RadxaBridge:
                         cap.release()
             except: pass
 
-        # Try 2: GoPro WiFi UDP stream
-        try:
-            cap = cv2.VideoCapture("udp://@0.0.0.0:8554", cv2.CAP_FFMPEG)
-            if cap.isOpened():
-                ret, f = cap.read()
-                if ret and f is not None:
-                    self.external_cap = cap
-                    self.external_available = True
-                    self.telemetry_cache['external_available'] = True
-                    print(f"✅ EXTERNAL (GoPro WiFi UDP): ACTIVE @ {f.shape[1]}x{f.shape[0]}")
-                    return True
-                cap.release()
-        except: pass
+        # GoPro WiFi UDP: only try if WiFi is already on GoPro network
+        # (prevents "bind failed" spam when not connected to GoPro WiFi)
+        if getattr(self, '_gopro_wifi_active', False):
+            try:
+                cap = cv2.VideoCapture("udp://@0.0.0.0:8554", cv2.CAP_FFMPEG)
+                if cap.isOpened():
+                    ret, f = cap.read()
+                    if ret and f is not None:
+                        self.external_cap = cap
+                        self.external_available = True
+                        self.telemetry_cache['external_available'] = True
+                        print(f"✅ EXTERNAL (GoPro WiFi UDP): ACTIVE @ {f.shape[1]}x{f.shape[0]}")
+                        return True
+                    cap.release()
+            except: pass
 
         self.external_available = False
         self.telemetry_cache['external_available'] = False
@@ -1554,9 +2111,10 @@ class RadxaBridge:
         if not self.internal_cap and not self.external_cap:
             print("🚨 NO CAMERAS DETECTED. Will keep retrying...")
 
-        # Periodic GoPro reconnection attempt (every 10s if not connected)
-        gopro_retry_interval = 10
+        # Periodic GoPro reconnection attempt (backs off to reduce log spam)
+        gopro_retry_interval = 30  # Start at 30s, back off to 120s
         last_gopro_retry = 0
+        gopro_retry_count = 0
         # V110: DUAL CAMERA STREAM LOOP
         self.frame_in_transit = False
         self.udp_streamers_init = False
@@ -1568,10 +2126,13 @@ class RadxaBridge:
                 loop = asyncio.get_running_loop()
                 current_time = int(time.time())
 
-                # --- Periodic GoPro reconnect if not available ---
+                # --- Periodic GoPro reconnect if not available (with backoff) ---
                 if not self.external_available and current_time - last_gopro_retry > gopro_retry_interval:
                     last_gopro_retry = current_time
+                    gopro_retry_count += 1
                     await self._try_connect_gopro()
+                    # Back off: 30s → 60s → 120s max
+                    gopro_retry_interval = min(120, 30 * gopro_retry_count)
 
                 # --- Periodic internal cam reconnect if lost ---
                 if self.internal_cap is None or not self.internal_cap.isOpened():
@@ -1728,22 +2289,95 @@ class RadxaBridge:
         finally:
             self.frame_in_transit = False
     async def lidar_loop(self):
-        """V102: REAL YDLIDAR DRIVER (Via Python SDK)"""
+        """V103: YDLIDAR with SDK -> raw serial fallback"""
+        import math
+
+        # --- Try SDK first, fall back to raw serial parser ---
+        use_sdk = False
         try:
             import ydlidar
+            use_sdk = True
+            print("✅ LIDAR: ydlidar SDK available")
         except ImportError:
-            print("❌ LIDAR: 'ydlidar' lib missing. Run fix_dependencies.sh")
-            return
+            print("⚠️ LIDAR: SDK missing, trying raw serial fallback (lidar_driver.py)")
 
+        if use_sdk:
+            await self._lidar_loop_sdk(ydlidar, math)
+        else:
+            await self._lidar_loop_serial(math)
+
+    def _send_lidar_to_fc(self, points_deg, math):
+        """Send the FULL 360° LiDAR ring to the FC as OBSTACLE_DISTANCE (72 × 5° sectors) so ArduPilot's
+        Proximity/AVOID knows the *direction* of every obstacle — NOT just the single nearest point
+        mislabelled 'forward' (the old bug: a wall on the LEFT was reported as 40cm in FRONT, so the FC
+        braked the wrong axis). points_deg = iterable of (angle_deg, dist_m) in the LiDAR's own frame.
+
+        ⚙️ FC PARAM REQUIRED: PRX1_TYPE=2 (MAVLink proximity) to consume OBSTACLE_DISTANCE. (With the old
+        PRX1_TYPE=4 the proximity read the single forward rangefinder — that is why rangefinder1 went to 0
+        when PRX was on: proximity 'claimed' the rangefinder. Type 2 reads the MAVLink ring instead, so
+        rangefinder1 is free to show the true FORWARD distance again from the DISTANCE_SENSOR below.)
+
+        Direction convention is bench-calibratable: LIDAR_YAW_OFFSET_DEG rotates the ring, LIDAR_DIR (+1/-1)
+        flips CW/CCW. Verify on Mission Planner's Proximity radar: an obstacle straight ahead must appear
+        at the TOP; if it's mirrored, flip LIDAR_DIR; if rotated, adjust the offset."""
+        if not self.fc:
+            return
+        MINCM, MAXCM = 10, 800
+        NOOBS = MAXCM + 1                              # MAVLink spec: max+1 = 'no measurement' (ignored)
+        sectors = [NOOBS] * 72                         # 72 × 5° = full 360°
+        off = float(getattr(self, 'LIDAR_YAW_OFFSET_DEG', 0.0))
+        dirn = int(getattr(self, 'LIDAR_DIR', -1))     # LiDAR CCW → ArduPilot CW (clockwise from nose)
+        fwd_min = None
+        for ang_deg, dist_m in points_deg:
+            if not (0.1 < dist_m < 8.0):
+                continue
+            cm = int(max(MINCM, min(MAXCM, dist_m * 100)))
+            ap = (off + dirn * ang_deg) % 360.0        # body frame, clockwise from forward (nose = 0°)
+            idx = int((ap + 2.5) // 5) % 72            # nearest 5° sector
+            if cm < sectors[idx]:
+                sectors[idx] = cm
+            fa = (ap + 180.0) % 360.0 - 180.0          # signed angle -180..180 for the 'forward' test
+            if abs(fa) <= 15.0 and (fwd_min is None or cm < fwd_min):
+                fwd_min = cm
+        try:
+            self.fc.mav.obstacle_distance_send(
+                int(time.time() * 1e6),                            # time_usec
+                mavutil.mavlink.MAV_DISTANCE_SENSOR_LASER,         # sensor_type = 0
+                sectors,                                           # 72 distances (cm)
+                5,                                                 # increment (deg per sector)
+                MINCM, MAXCM,                                      # min/max (cm)
+                0.0,                                               # increment_f (0 → use `increment`)
+                0.0,                                               # angle_offset
+                getattr(mavutil.mavlink, 'MAV_FRAME_BODY_FRD', 12) # body FRD: CW from forward
+            )
+        except Exception as e:
+            if int(time.time()) % 10 == 0:
+                print(f"⚠️ obstacle_distance_send failed: {e}")
+        # TRUE forward distance (not the global min) → keeps rangefinder1 meaningful when RNGFND1_ORIENT=0.
+        # time_boot_ms = real ms (Jul-2 diagnostic improvement, kept — was 0).
+        if fwd_min is not None and MINCM < fwd_min <= MAXCM:
+            try:
+                self.fc.mav.distance_sensor_send(int(time.time() * 1000) & 0xFFFFFFFF,
+                                                 MINCM, MAXCM, int(fwd_min), 0, 0, 0, 0)
+            except Exception as _se:
+                print(f"❌ LIDAR SEND FAILED: {_se}")
+        # Jul-2 diagnostic (kept): periodic send counter in the journal proves the ring is flowing.
+        self._dbg_send_count = getattr(self, '_dbg_send_count', 0) + 1
+        if self._dbg_send_count % 40 == 0:
+            _known = sum(1 for s in sectors if s <= MAXCM)
+            print(f"📡 LIDAR RING #{self._dbg_send_count}: {_known}/72 sectors, fwd={fwd_min}cm fc={self.fc is not None}")
+
+    async def _lidar_loop_sdk(self, ydlidar, math):
+        """YDLIDAR via official Python SDK"""
         ports = ["/dev/ttyUSB0", "/dev/ttyUSB1", "/dev/ttyACM0"]
         laser = None
-        
-        print(f"🔭 LIDAR: Scanning ports {ports}...")
+
+        print(f"🔭 LIDAR SDK: Scanning ports {ports}...")
 
         for port in ports:
             temp_laser = ydlidar.CYdLidar()
             temp_laser.setlidaropt(ydlidar.LidarPropSerialPort, port)
-            temp_laser.setlidaropt(ydlidar.LidarPropSerialBaudrate, 128000)
+            temp_laser.setlidaropt(ydlidar.LidarPropSerialBaudrate, 115200)
             temp_laser.setlidaropt(ydlidar.LidarPropLidarType, ydlidar.TYPE_TRIANGLE)
             temp_laser.setlidaropt(ydlidar.LidarPropDeviceType, ydlidar.YDLIDAR_TYPE_SERIAL)
             temp_laser.setlidaropt(ydlidar.LidarPropScanFrequency, 5.0)
@@ -1753,50 +2387,41 @@ class RadxaBridge:
             temp_laser.setlidaropt(ydlidar.LidarPropMinRange, 0.1)
 
             if temp_laser.initialize():
-                print(f"✅ LIDAR: FOUND @ {port}")
+                print(f"✅ LIDAR SDK: FOUND @ {port}")
                 laser = temp_laser
                 break
             else:
-                print(f"   Lidar fetch failed on {port}")
-        
+                print(f"   Lidar SDK failed on {port}")
+
         if laser is None:
-            print("❌ LIDAR: Init Failed on ALL ports. Check USB.")
-            await asyncio.sleep(5)
+            print("❌ LIDAR SDK: Init Failed on ALL ports. Falling back to raw serial...")
+            await self._lidar_loop_serial(math)
             return
 
-        # BYPASS: turnOn() reports "Device Tremble" but user says it's physically stable
-        # SDK health check is too sensitive. Skip it and go straight to scanning.
         print("⚠️ BYPASSING turnOn() health check (too sensitive)")
-        print("✅ LIDAR: Starting scan loop directly...")
+        print("✅ LIDAR SDK: Starting scan loop...")
         scan = ydlidar.LaserScan()
 
         while self.running:
             try:
                  ret = laser.doProcessSimple(scan)
                  if ret:
-                     # Find minimum distance to prioritize safety
                      min_dist = 10.0
-
-                     # Check Forward Sector (approx logic)
-                     # Real implementation uses point.angle
+                     pts_deg = []
                      for i in range(scan.points.size()):
                          point = scan.points[i]
                          if point.range > 0.1 and point.range < min_dist:
                              min_dist = point.range
+                         if point.range > 0.1:
+                             pts_deg.append((math.degrees(point.angle), point.range))  # SDK angle = radians
 
-                     # Send to FC (cm)
-                     dist_cm = int(min_dist * 100)
-                     if dist_cm > 10 and dist_cm < 800:
-                         self.fc.mav.distance_sensor_send(
-                                0, 10, 800, dist_cm, 0, 0, 0, 0
-                         )
+                     # Full 360° ring → FC proximity (direction-aware), + true forward → rangefinder1.
+                     self._send_lidar_to_fc(pts_deg, math)
 
                      self.telemetry_cache['obstacle_dist'] = min_dist
-                     self.telemetry_cache['lidar_dist'] = min_dist  # Used by SafetyEnvelope
-                     self.telemetry_cache['lidar_status'] = "ACTIVE"
+                     self.telemetry_cache['lidar_dist'] = min_dist
+                     self.telemetry_cache['lidar_status'] = "ACTIVE_SDK"
 
-                     # Build point cloud for Laptop AI spatial grid
-                     import math
                      lidar_points = []
                      for i in range(scan.points.size()):
                          pt = scan.points[i]
@@ -1805,9 +2430,8 @@ class RadxaBridge:
                              y = pt.range * math.sin(pt.angle)
                              lidar_points.append([round(x, 2), round(y, 2)])
 
-                     # Broadcast lidar_scan to laptop AI (max 200 points to save bandwidth)
                      if lidar_points:
-                         step = max(1, len(lidar_points) // 200)
+                         step = max(1, len(lidar_points) // 400)  # 400 pts/scan: precision cloud (was 200)
                          sampled = lidar_points[::step]
                          scan_msg = json.dumps({"type": "lidar_scan", "payload": {"points": sampled}})
                          if self.ws:
@@ -1820,8 +2444,99 @@ class RadxaBridge:
 
                  await asyncio.sleep(0.05)
             except Exception as e:
-                print(f"Lidar Error: {e}")
+                print(f"Lidar SDK Error: {e}")
                 await asyncio.sleep(1)
+
+    async def _lidar_loop_serial(self, math):
+        """Fallback: raw serial protocol parser (no SDK needed)"""
+        try:
+            from lidar_driver import YDLidarDriver
+        except ImportError:
+            # lidar_driver.py not found — lidar fully unavailable
+            print("❌ LIDAR: Both SDK and serial driver unavailable. LIDAR OFFLINE.")
+            self.telemetry_cache['lidar_status'] = "OFFLINE"
+            self.telemetry_cache['lidar_dist'] = 0.5  # Conservative: assume obstacle nearby
+            return
+
+        driver = YDLidarDriver(port='/dev/ttyUSB0', baudrate=115200)
+        if not driver.start():
+            print("❌ LIDAR SERIAL: Failed to find lidar on any USB port. LIDAR OFFLINE.")
+            self.telemetry_cache['lidar_status'] = "OFFLINE"
+            self.telemetry_cache['lidar_dist'] = 0.5
+            return
+
+        print("✅ LIDAR SERIAL: Running via raw protocol parser (fallback mode)")
+        self.telemetry_cache['lidar_status'] = "ACTIVE_SERIAL"
+
+        while self.running:
+            try:
+                scan = driver.get_scan()
+                if not scan:
+                    await asyncio.sleep(0.1)
+                    continue
+
+                # Find minimum distance
+                min_dist = 10.0
+                lidar_points = []
+                pts_deg = []
+                for angle, dist in scan:
+                    if 0.1 < dist < 8.0:
+                        if dist < min_dist:
+                            min_dist = dist
+                        x = dist * math.cos(math.radians(angle))
+                        y = dist * math.sin(math.radians(angle))
+                        lidar_points.append([round(x, 2), round(y, 2)])
+                        pts_deg.append((angle, dist))              # serial angle already in degrees
+
+                # Full 360° ring → FC proximity (direction-aware), + true forward → rangefinder1.
+                self._send_lidar_to_fc(pts_deg, math)
+
+                self.telemetry_cache['obstacle_dist'] = min_dist
+                self.telemetry_cache['lidar_dist'] = min_dist
+                self.telemetry_cache['lidar_status'] = "ACTIVE_SERIAL"
+
+                # === VISO: no-GPS INDOOR position from 2D LiDAR SLAM -> FC via VISION_POSITION_ESTIMATE.
+                #     Gives the EKF a position (EK3_SRC=ExternalNav) -> Loiter/PosHold/GUIDED + arms without
+                #     GPS. Only runs when there is NO GPS 3D fix (outdoors the real GPS supersedes it). ===
+                try:
+                    if int(self.telemetry_cache.get('gps_fix', 0) or 0) < 3:
+                        if not hasattr(self, '_pose_est'):
+                            from lidar_pose import LidarPoseEstimator
+                            self._pose_est = LidarPoseEstimator()
+                            self._pose_t = time.time()
+                        _now = time.time(); _dt = max(0.02, min(0.5, _now - self._pose_t)); self._pose_t = _now
+                        _hdg = float(self.telemetry_cache.get('heading', 0) or 0)
+                        px, py, pyaw = self._pose_est.update(scan, _hdg, dt=_dt, odom_vel=(0.0, 0.0))
+                        _alt = float(self.telemetry_cache.get('altitude_baro',
+                                     self.telemetry_cache.get('altitude', 0)) or 0)
+                        # ArduPilot NED earth frame: x=North, y=East, z=Down. Our SLAM frame @heading0:
+                        # x=right(East), y=forward(North) -> North=py, East=px, Down=-alt.
+                        # ⚠️ frame mapping + EKF fusion need on-drone verification (Mission Planner).
+                        self.fc.mav.vision_position_estimate_send(
+                            int(_now * 1e6), py, px, -_alt, 0.0, 0.0, math.radians(pyaw))
+                        self.telemetry_cache['slam_pose'] = [round(px, 2), round(py, 2), round(pyaw, 1)]
+                except Exception:
+                    pass
+
+                # Broadcast to laptop AI
+                if lidar_points:
+                    step = max(1, len(lidar_points) // 400)  # 400 pts/scan: precision cloud (was 200)
+                    sampled = lidar_points[::step]
+                    scan_msg = json.dumps({"type": "lidar_scan", "payload": {"points": sampled}})
+                    if self.ws:
+                        try: await self.ws.send(scan_msg)
+                        except: pass
+                    if self.local_clients:
+                        for c in list(self.local_clients):
+                            try: await c.send(scan_msg)
+                            except: pass
+
+                await asyncio.sleep(0.05)
+            except Exception as e:
+                print(f"Lidar Serial Error: {e}")
+                await asyncio.sleep(1)
+
+        driver.stop()
 
         laser.turnOff()
         laser.disconnecting()
@@ -1833,7 +2548,9 @@ class RadxaBridge:
             # V110: FAILSAFE - Return to USER'S LAST LOCATION on disconnect (not launch point)
             last_msg_delta = time.time() - self.last_cloud_msg
 
-            if last_msg_delta > 5.0 and not self.watchdog_triggered and self.is_armed:
+            # Only trigger RTH if armed AND airborne (altitude > 1m)
+            airborne = self.telemetry_cache.get('altitude', 0) > 1.0
+            if last_msg_delta > 30.0 and not self.watchdog_triggered and self.is_armed and airborne:
                  self.watchdog_triggered = True
                  # Priority: Return to user GPS if available, else RTL to launch
                  if self.user_gps:
@@ -2016,9 +2733,10 @@ if __name__ == "__main__":
     try:
         async def main():
             # Run everything in parallel so Video/Cloud doesn't wait for FC
-            await asyncio.gather( 
+            await asyncio.gather(
                 bridge.connect_mavlink(),
                 bridge.connect_cloud(),
+                bridge.telemetry_loop(),  # Runs independently — NOT tied to cloud WS
                 bridge.video_loop(),
                 bridge.lidar_loop(),
                 bridge.esp32_hardware_loop(),

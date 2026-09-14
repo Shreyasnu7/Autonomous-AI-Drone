@@ -1,0 +1,3 @@
+websockets
+requests
+mavsdk ; extra == "yes"  # optional, install only if you plan to use MAVSDK telemetry on Radxa

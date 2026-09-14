@@ -1,13 +1,38 @@
 # laptop_ai/config.py
 import os
+import subprocess
 
-# EDIT THESE VALUES for your environment.
+# ===== CONNECTION MODE =====
+# Priority: TAILSCALE (fastest) → RENDER (fallback)
+# Tailscale IPs (from tailscale admin)
+CUBIE_TAILSCALE_IP = os.getenv("CUBIE_TS_IP", "100.89.83.125")
+LAPTOP_TAILSCALE_IP = os.getenv("LAPTOP_TS_IP", "100.84.75.22")
 
-# WebSocket relay (Railway/Render).
-VPS_WS = os.getenv("VPS_WS_URL", "wss://drone-server-r0qe.onrender.com/ws/connect/laptop_vision")
+# Auto-detect: is Tailscale running and can we reach the Cubie?
+# Use a real TCP connection (ICMP ping is often blocked over Tailscale/networks).
+def _check_tailscale():
+    import socket
+    for port in (8000, 8080):  # bridge WS + video server
+        try:
+            s = socket.create_connection((CUBIE_TAILSCALE_IP, port), timeout=2)
+            s.close()
+            return True
+        except Exception:
+            continue
+    return False
 
-# HTTP server base (FastAPI endpoints)
-API_BASE = os.getenv("API_BASE", "https://drone-server-r0qe.onrender.com")
+USE_TAILSCALE = _check_tailscale()
+
+if USE_TAILSCALE:
+    # TAILSCALE MODE — direct connection, <50ms latency
+    VPS_WS = os.getenv("VPS_WS_URL", f"ws://{CUBIE_TAILSCALE_IP}:8000")
+    API_BASE = os.getenv("API_BASE", f"http://{CUBIE_TAILSCALE_IP}:8080")
+    print(f"🔗 CONNECTION: TAILSCALE DIRECT (ws://{CUBIE_TAILSCALE_IP}:8000)")
+else:
+    # RENDER MODE — cloud relay, 200-500ms latency
+    VPS_WS = os.getenv("VPS_WS_URL", "wss://drone-server-r0qe.onrender.com/ws/connect/laptop_vision")
+    API_BASE = os.getenv("API_BASE", "https://drone-server-r0qe.onrender.com")
+    print(f"🌐 CONNECTION: RENDER CLOUD RELAY (slower, Tailscale not available)")
 
 # Shared secret token (must match server)
 AUTH_TOKEN = os.getenv("AUTH_TOKEN", "SUPER_SECRET_DRONE_KEY_123")

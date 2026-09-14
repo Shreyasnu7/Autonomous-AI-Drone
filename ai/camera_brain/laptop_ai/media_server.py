@@ -15,7 +15,11 @@ class MediaServer:
         self.app = web.Application()
         self.runner = None
         self.site = None
-        
+
+        # add_static() resolves the path strictly, so the dir MUST exist before this line.
+        # (The makedirs in start() runs too late — __init__ would already have crashed.)
+        os.makedirs(MEDIA_DIR, exist_ok=True)
+
         # Routes
         self.app.router.add_get('/media', self.list_media)
         self.app.router.add_static('/media', path=MEDIA_DIR, show_index=True)

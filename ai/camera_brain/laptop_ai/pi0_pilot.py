@@ -83,6 +83,9 @@ class Pi0Pilot:
         self.kp = 0.5
         self.ki = 0.01
         self.kd = 0.15
+        # PD output tilt clamp tracks the FC's REAL max lean (ANGLE_MAX), refreshed in calibrate().
+        # Default = ArduCopter default 45° (a sane envelope, NOT a low guess); this build's FC = 60°.
+        self.max_tilt_deg = 45.0
         self.integral_x = 0.0
         self.integral_y = 0.0
         self.prev_err_x = 0.0
@@ -92,17 +95,65 @@ class Pi0Pilot:
         self.max_roll = 30.0    # degrees
         self.max_pitch = 30.0   # degrees
         self.max_yaw_rate = 90.0  # deg/s
-        self.min_obstacle_dist = 1.5  # meters — emergency brake
-        
+
+        # === F450 FRAME GEOMETRY + DYNAMIC STOPPING DISTANCE ===
+        # F450 = 450mm motor-to-motor diagonal -> arm length ~225mm from centre.
+        # Minimum standoff = 2 x arm length (props can't be closer than this to anything).
+        self.arm_length_m = 0.225
+        self.min_standoff_m = 2.0 * self.arm_length_m          # 0.45 m hard floor
+        # Flight-performance constants (calibratable — refined from observed braking, see calibrate()).
+        self.mass_kg = 1.2                                     # F450 + 3S + GoPro, typical
+        self.max_decel_ms2 = 2.5                               # gentle, safe braking authority
+        self.reaction_time_s = 0.30                            # sensor + control latency buffer
+        self._brake_active = False                             # for log-throttling
+        # Legacy name kept so old refs don't break; now just the hard floor.
+        self.min_obstacle_dist = self.min_standoff_m
+
         # Try to load real model
         self._load_model()
         
         mode_str = self.model_type.upper() if self.model_type else "NONE"
         print(f"✅ Pi0-FAST Pilot Loaded ({mode_str} mode, {self.control_rate}Hz)")
 
+    def calibrate(self, telem: dict):
+        """
+        Self-calibrate flight constants from live telemetry — refines the stopping radius
+        to the drone's REAL performance instead of fixed guesses.
+
+        - mass: inferred from hover throttle (more throttle to hover = heavier / weaker).
+        - max_decel: learned from observed deceleration when braking (EMA), so the safety
+          radius matches how hard THIS drone can actually stop.
+        Full centre-of-mass / inertia ID needs dedicated flight manoeuvres (logged for later);
+        this gives a continuously-improving, grounded estimate from normal flight.
+        """
+        try:
+            # 0. FC lean limit -> the PD output clamp tracks the drone's REAL max tilt (live, not a guess).
+            _ml = telem.get('max_lean_deg')
+            if _ml and 5.0 < float(_ml) <= 80.0:
+                self.max_tilt_deg = float(_ml)
+            # 1. Mass estimate from hover throttle ratio (0..1). 0.5 = nominal hover.
+            hov = telem.get('hover_throttle') or telem.get('thr_hover')
+            if hov and 0.2 < float(hov) < 0.95:
+                # heavier drone hovers at higher throttle; scale nominal 1.2kg by ratio to 0.55
+                self.mass_kg = float(np.clip(1.2 * (float(hov) / 0.55), 0.6, 3.0))
+
+            # 2. Learn real braking decel from speed drop while braking.
+            now = time.time()
+            v = float(np.hypot(telem.get('vx', 0.0), telem.get('vy', 0.0)))
+            pv = getattr(self, '_cal_prev_v', None); pt = getattr(self, '_cal_prev_t', now)
+            if pv is not None and self._brake_active and (now - pt) > 0.02:
+                decel = (pv - v) / (now - pt)
+                if decel > 0.3:  # actually slowing down
+                    # EMA toward observed decel (clamped to sane copter range)
+                    obs = float(np.clip(decel, 0.5, 6.0))
+                    self.max_decel_ms2 = 0.9 * self.max_decel_ms2 + 0.1 * obs
+            self._cal_prev_v = v; self._cal_prev_t = now
+        except Exception:
+            pass
+
     def _load_model(self):
         """Try to load the best available model runtime."""
-        
+
         for path in self.MODEL_PATHS:
             if not os.path.exists(path):
                 continue
@@ -174,16 +225,39 @@ class Pi0Pilot:
         altitude = state_vector.get('altitude', 0.0)
         heading = state_vector.get('heading', 0.0)
         
-        # === SAFETY: Emergency obstacle braking ===
-        if depth < self.min_obstacle_dist:
-            logger.warning(f"🛑 Pi0 EMERGENCY: Obstacle at {depth:.1f}m — full brake")
+        # === SAFETY: DYNAMIC obstacle braking (speed-aware stopping radius) ===
+        # The stop radius grows with speed: d_safe = min_standoff + reaction_creep + v^2/(2*decel).
+        # Slow drone -> tight radius (approaches close); fast drone -> brakes early.
+        # Floored at the F450 physical minimum (2x arm length). Braking is PROPORTIONAL, not binary,
+        # so it eases to a stop at the right distance instead of spamming full brake.
+        speed = float(np.hypot(vx, vy))                                  # current horizontal speed (m/s)
+        stop_dist = (speed * speed) / (2.0 * self.max_decel_ms2)         # kinematic stopping distance
+        reaction_creep = speed * self.reaction_time_s                    # distance covered during latency
+        d_safe = self.min_standoff_m + reaction_creep + stop_dist
+
+        # Valid positive reading only (0/-0.0/negative = no data, NOT an obstacle).
+        if 0.05 < depth < d_safe:
+            # How deep into the safety zone are we? 0 at d_safe edge, 1 at the hard floor.
+            span = max(d_safe - self.min_standoff_m, 1e-3)
+            brake = float(np.clip((d_safe - depth) / span, 0.0, 1.0))
+            if depth <= self.min_standoff_m:
+                brake = 1.0                                              # inside the no-go floor: full stop
+            if not self._brake_active:
+                logger.warning(f"🛑 Pi0 BRAKE: obs {depth*100:.0f}cm < safe {d_safe*100:.0f}cm "
+                               f"(v={speed:.1f}m/s) — easing {brake*100:.0f}%")
+                self._brake_active = True
             return {
                 "roll": 0.0,
-                "pitch": 5.0,  # Slight pull-back
+                "pitch": 6.0 * brake,        # pull back proportional to urgency
                 "yaw_rate": 0.0,
-                "throttle": 0.5,  # Maintain altitude
-                "emergency": True
+                "throttle": 0.5,             # hold altitude
+                "emergency": brake >= 0.99,  # only a true emergency at the floor
+                "brake": brake,
             }
+        else:
+            if self._brake_active:
+                logger.info(f"✅ Pi0: path clear (obs {depth*100:.0f}cm ≥ safe {d_safe*100:.0f}cm)")
+                self._brake_active = False
         
         # === RUN POLICY ===
         if self.model_type == "tensorrt":
@@ -206,9 +280,14 @@ class Pi0Pilot:
         return commands
 
     def _pd_control(self, err_x, err_y, vx, vy, dt):
-        """PID controller fallback — works without any model."""
+        """PID controller fallback — works without any model. Hardened (#4): error deadband + output
+        clamp so it's a solid pilot in the absence of a trained Pi0 neural model."""
         dt = max(dt, 0.001)
-        
+
+        # Deadband: ignore tiny errors so we don't micro-jitter when the target is already centred.
+        if abs(err_x) < 0.03: err_x = 0.0
+        if abs(err_y) < 0.03: err_y = 0.0
+
         # Integral (with anti-windup)
         self.integral_x = np.clip(self.integral_x + err_x * dt, -5.0, 5.0)
         self.integral_y = np.clip(self.integral_y + err_y * dt, -5.0, 5.0)
@@ -221,10 +300,12 @@ class Pi0Pilot:
         
         roll = err_x * self.kp + self.integral_x * self.ki + d_err_x * self.kd
         pitch = err_y * self.kp + self.integral_y * self.ki + d_err_y * self.kd
-        
+
+        # Output clamp tied to the FC's REAL max lean (ANGLE_MAX, via calibrate) — not a hardcoded guess.
+        _MAX_DEG = getattr(self, 'max_tilt_deg', 45.0)
         return {
-            "roll": roll * 30.0,   # Scale to degrees
-            "pitch": pitch * 30.0,
+            "roll": float(np.clip(roll * 30.0, -_MAX_DEG, _MAX_DEG)),   # degrees, clamped
+            "pitch": float(np.clip(pitch * 30.0, -_MAX_DEG, _MAX_DEG)),
             "yaw_rate": 0.0,
             "throttle": 0.5
         }

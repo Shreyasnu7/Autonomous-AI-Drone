@@ -17,6 +17,10 @@ class CameraStream:
         self.stream.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self.stream.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self.stream.set(cv2.CAP_PROP_FPS, fps)
+        try:
+            self.stream.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # keep only the freshest frame — kills the RTSP lag backlog
+        except Exception:
+            pass
         
         if not self.stream.isOpened():
             print("⚠️ Camera Stream Failed to Open")
