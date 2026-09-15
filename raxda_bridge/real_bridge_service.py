@@ -1045,6 +1045,12 @@ class RadxaBridge:
                          vx = msg.vx / 100.0
                          vy = msg.vy / 100.0
                          self.telemetry_cache['speed'] = (vx**2 + vy**2)**0.5
+                         # Keep the COMPONENTS too, not just the magnitude. The SLAM pose estimator
+                         # wants a dead-reckoning prior and was being handed a hardcoded (0,0), so
+                         # its hill-climb had to re-find the position from scratch on every scan
+                         # instead of starting from where the aircraft was actually heading.
+                         self.telemetry_cache['vel_n'] = vx      # NED north component (m/s)
+                         self.telemetry_cache['vel_e'] = vy      # NED east component (m/s)
                          # Heading from GPS (cdeg to deg)
                          self.telemetry_cache['heading'] = msg.hdg / 100.0 if msg.hdg != 65535 else self.telemetry_cache.get('heading', 0)
 
@@ -2838,7 +2844,15 @@ class RadxaBridge:
                             self._pose_t = time.time()
                         _now = time.time(); _dt = max(0.02, min(0.5, _now - self._pose_t)); self._pose_t = _now
                         _hdg = float(self.telemetry_cache.get('heading', 0) or 0)
-                        px, py, pyaw = self._pose_est.update(scan, _hdg, dt=_dt, odom_vel=(0.0, 0.0))
+                        # Dead-reckoning prior in BODY frame (forward, right) from the EKF's NED
+                        # velocity, rotated by heading. Zero while the EKF has no solution, which
+                        # is the same behaviour as before -- but once it does, the prior tracks.
+                        _vn = float(self.telemetry_cache.get('vel_n', 0.0) or 0.0)
+                        _ve = float(self.telemetry_cache.get('vel_e', 0.0) or 0.0)
+                        _hr = math.radians(_hdg)
+                        _odom = (_vn * math.cos(_hr) + _ve * math.sin(_hr),      # body forward
+                                 -_vn * math.sin(_hr) + _ve * math.cos(_hr))     # body right
+                        px, py, pyaw = self._pose_est.update(scan, _hdg, dt=_dt, odom_vel=_odom)
                         _alt = float(self.telemetry_cache.get('altitude_baro',
                                      self.telemetry_cache.get('altitude', 0)) or 0)
                         # ArduPilot NED earth frame: x=North, y=East, z=Down. Our SLAM frame @heading0:
