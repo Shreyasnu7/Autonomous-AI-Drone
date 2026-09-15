@@ -86,6 +86,16 @@ def _norm_reason(s):
 _HEAD_AZ = {                              # body-frame AZIMUTH in degrees (0=fwd, +=right, spherical)
     "fwd": 0.0, "fwd_right": 45.0, "right": 90.0, "back_right": 135.0,
     "back": 180.0, "back_left": -135.0, "left": -90.0, "fwd_left": -45.0,
+    # Synonyms. An unrecognised head word falls through to the hover branch, so a model that
+    # said "forward" instead of "fwd" stopped the aircraft dead with no warning -- the failure
+    # is silent and indistinguishable from a chosen hover. _CLIMB_ELEV already accepted
+    # synonyms; this map accepted none.
+    "forward": 0.0, "ahead": 0.0, "front": 0.0, "f": 0.0,
+    "forward_right": 45.0, "front_right": 45.0, "diag_right": 45.0,
+    "forward_left": -45.0, "front_left": -45.0, "diag_left": -45.0,
+    "backward": 180.0, "backwards": 180.0, "behind": 180.0, "reverse": 180.0, "b": 180.0,
+    "backward_right": 135.0, "backward_left": -135.0,
+    "r": 90.0, "starboard": 90.0, "l": -90.0, "port": -90.0,
 }
 _CLIMB_ELEV = {                           # ELEVATION angle in degrees = the flight SLOPE (up=+, dive=-)
     "dive_steep": -25.0, "dive": -12.0, "descend": -12.0, "down": -12.0,
@@ -150,6 +160,10 @@ def _resolve_intent(head, climb, sensors, pace="cruise", yaw_mode="face_travel",
     lim = _drone_limits(sensors)          # THIS drone's live FC envelope (speed/climb/descent/yaw)
     def _vz_clamp(v): return max(-lim["descent"], min(lim["climb"], v))
     az = _HEAD_AZ.get(head)
+    if az is None and head not in ("hover", "stop", "hold", "", "none"):
+        # A deliberate hover is expected; an unrecognised direction is not. Say so, because the
+        # resulting dead stop is indistinguishable from the pilot choosing to hold.
+        logger.warning(f"unknown head direction {head!r} -> treating as hover")
     if az is None:                        # hover/stop -> hold position, but still allow a vertical slope
         vz = _vz_clamp(0.30 * (1 if elev > 0 else (-1 if elev < 0 else 0)))  # capped to the drone's climb/descent
         return {"vx": 0.0, "vy": 0.0, "vz": round(vz, 3),
