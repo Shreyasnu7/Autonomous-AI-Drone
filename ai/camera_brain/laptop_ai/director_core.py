@@ -1030,7 +1030,27 @@ class DirectorCore:
             current_source = self.fusion.select_best_source() # "internal" or "gopro"
             
             # Handle "No Signal" — BLIND MODE (camera/GoPro down). Lidar + ESP still fly the drone.
+            # BLIND = no frame, OR a frame carrying no scene. A stalled capture now returns
+            # None (the camera thread expires frames), but a feed delivering BLACK or corrupted
+            # images is not None and used to be treated as a normal view: monocular depth on a
+            # uniform frame returns a confident ~5.7 m everywhere, which was then written into
+            # the obstacle map as real geometry. Judge the frame's content, not just its
+            # existence -- a near-uniform image carries no depth information.
             self._blind = (raw_frame is None)
+            if raw_frame is not None:
+                try:
+                    _small = raw_frame[::8, ::8]
+                    if float(_small.std()) < 3.0:          # essentially featureless
+                        self._blind = True
+                        if not getattr(self, '_blank_warned', False):
+                            self._blank_warned = True
+                            print("⚠️ Camera frame is featureless (black or corrupt) - "
+                                  "treating as BLIND; flying on LiDAR/ToF")
+                    elif getattr(self, '_blank_warned', False):
+                        self._blank_warned = False
+                        print("✓ Camera image restored")
+                except Exception:
+                    pass
             if raw_frame is None:
                 # No Camera -> Show Disconnected Screen
                 blank_frame.fill(0)
