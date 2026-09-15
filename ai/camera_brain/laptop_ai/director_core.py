@@ -1663,6 +1663,39 @@ class DirectorCore:
                             # HARD CLEARANCE CLAMP (zero-wrong guarantee): cap the AI's raw speed to the
                             # stopping-distance table using ground-truth clearances, BEFORE dynamic dodge.
                             # A mis-computed AI velocity (e.g. vx0.5 into a 40cm wall) can NEVER execute.
+                            # ACTIVE DOME SWEEP. A small forward/back oscillation pitches the
+                            # airframe, which sweeps the LiDAR's single plane through elevation
+                            # and fills in the dome above and below the flight path. Deliberately
+                            # constrained, because this is the one part of the scanner that moves
+                            # the aircraft at all:
+                            #   * only while AIRBORNE and essentially hovering -- it must never
+                            #     perturb a manoeuvre the pilot or a mission is flying
+                            #   * only when no target is being tracked and no command is running
+                            #   * only while the dome is still poorly known
+                            #   * amplitude is a velocity, not an attitude demand, and it is
+                            #     applied BEFORE the clearance clamp and reactive avoidance, so a
+                            #     sweep can never push the aircraft toward something
+                            #   * it is a symmetric oscillation, so it nets to zero displacement
+                            # Set DOME_ACTIVE_TILT=0 to disable it entirely.
+                            try:
+                                if (os.getenv("DOME_ACTIVE_TILT", "1") == "1"
+                                        and getattr(self, '_airborne', False)
+                                        and not getattr(self, '_mission_target', None)
+                                        and time.time() >= getattr(self, '_command_until', 0.0)
+                                        and (abs(bvx) + abs(bvy)) < 0.15
+                                        and self.dome.coverage() < DomeScanner.COVERAGE_TARGET):
+                                    _amp = float(os.getenv("DOME_TILT_VEL_MS", "0.10"))
+                                    _ph = (time.time() % DomeScanner.TILT_PERIOD_S) / DomeScanner.TILT_PERIOD_S
+                                    bvx += _amp * (4.0 * abs(_ph - 0.5) - 1.0)
+                                    if not getattr(self, '_sweep_logged', False):
+                                        self._sweep_logged = True
+                                        print(f"🔁 Dome sweep active ({self.dome.coverage()*100:.0f}% "
+                                              f"known) - gentle pitch oscillation while hovering")
+                                elif getattr(self, '_sweep_logged', False) and                                         self.dome.coverage() >= DomeScanner.COVERAGE_TARGET:
+                                    self._sweep_logged = False
+                                    print("✓ Dome sweep complete - surroundings mapped")
+                            except Exception:
+                                pass
                             bvx, bvy, bvz, _clamped = self._enforce_clearance(bvx, bvy, bvz)
                             # Reactive avoidance: caution radius + active dodge (never a blind stop).
                             # Hover (0,0) still gets pushed off approaching objects = evasion.
