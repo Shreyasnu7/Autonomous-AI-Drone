@@ -24,16 +24,30 @@ def _check_tailscale():
 
 USE_TAILSCALE = _check_tailscale()
 
+# The control path is LOCAL by design. Falling back to the cloud relay silently was a
+# real defect: with CUBIE_TS_IP unset the probe below fails and every command would have
+# been routed through Render without anyone being told. Cloud is now opt-in.
+ALLOW_CLOUD_FALLBACK = os.getenv("ALLOW_CLOUD_FALLBACK", "0") not in ("0", "", "false", "False")
+
 if USE_TAILSCALE:
-    # TAILSCALE MODE — direct connection, <50ms latency
+    # DIRECT MODE - local link, <50ms latency
     VPS_WS = os.getenv("VPS_WS_URL", f"ws://{CUBIE_TAILSCALE_IP}:8000")
     API_BASE = os.getenv("API_BASE", f"http://{CUBIE_TAILSCALE_IP}:8080")
-    print(f"🔗 CONNECTION: TAILSCALE DIRECT (ws://{CUBIE_TAILSCALE_IP}:8000)")
-else:
-    # RENDER MODE — cloud relay, 200-500ms latency
+    print(f"[LINK] DIRECT to companion: ws://{CUBIE_TAILSCALE_IP}:8000")
+elif ALLOW_CLOUD_FALLBACK:
     VPS_WS = os.getenv("VPS_WS_URL", "wss://drone-server-r0qe.onrender.com/ws/connect/laptop_vision")
     API_BASE = os.getenv("API_BASE", "https://drone-server-r0qe.onrender.com")
-    print(f"🌐 CONNECTION: RENDER CLOUD RELAY (slower, Tailscale not available)")
+    print("[LINK] CLOUD RELAY (explicitly enabled via ALLOW_CLOUD_FALLBACK)")
+else:
+    raise SystemExit(
+        "\n[LINK] Cannot reach the companion computer at "
+        + str(CUBIE_TAILSCALE_IP) + ":8000/8080." + "\n"
+        "       The default is a PLACEHOLDER - set the real address, e.g." + "\n"
+        "           set CUBIE_TS_IP=100.x.y.z       (Windows)" + "\n"
+        "           export CUBIE_TS_IP=100.x.y.z    (Linux/WSL)" + "\n"
+        "       Refusing to route the control path over the cloud relay." + "\n"
+        "       To use the cloud relay anyway: ALLOW_CLOUD_FALLBACK=1" + "\n"
+    )
 
 # Shared secret token (must match server)
 AUTH_TOKEN = os.getenv("AUTH_TOKEN", "SUPER_SECRET_DRONE_KEY_123")

@@ -643,6 +643,29 @@ class RadxaBridge:
                     self.fc.mav.param_set_send(self.fc.target_system, self.fc.target_component, b'ARMING_CHECK', 0, mavutil.mavlink.MAV_PARAM_TYPE_UINT32)
                     # RESTORED (wiped 6-30..7-02, orig patch_thr_dz 6-24):
                     self.fc.mav.param_set_send(self.fc.target_system, self.fc.target_component, b'THR_DZ', 0, mavutil.mavlink.MAV_PARAM_TYPE_INT16)  # no ALT_HOLD throttle deadzone -> small climb cmds climb
+
+                    # --- Obstacle-avoidance prerequisites -------------------------------
+                    # PRX1_TYPE=2 (MAVLink proximity) is REQUIRED for ArduPilot to consume the
+                    # 360-degree OBSTACLE_DISTANCE ring this bridge publishes. With the previous
+                    # value (4 = RangeFinder) the firmware ignored the ring entirely and
+                    # BendyRuler/Dijkstra avoidance never ran. Enforced here so it survives a
+                    # reflash or a parameter reset instead of depending on a manual GCS edit.
+                    self.fc.mav.param_set_send(self.fc.target_system, self.fc.target_component,
+                                               b'PRX1_TYPE', 2, mavutil.mavlink.MAV_PARAM_TYPE_INT8)
+                    # AUTO_OPTIONS=3: bit0 allows arming in AUTO, bit1 allows the takeoff item to
+                    # run without a pilot throttle raise. Without it an app-flown mission arms and
+                    # then sits on the ground (SITL-confirmed).
+                    self.fc.mav.param_set_send(self.fc.target_system, self.fc.target_component,
+                                               b'AUTO_OPTIONS', 3, mavutil.mavlink.MAV_PARAM_TYPE_INT32)
+                    print("⚙️ FC params enforced: PRX1_TYPE=2, AUTO_OPTIONS=3")
+
+                    # Read back the rest of the avoidance chain and report it. These are NOT
+                    # written automatically -- they are reported so a wrong value is visible
+                    # rather than silently disabling avoidance in flight.
+                    for _p in (b'PRX1_TYPE', b'AUTO_OPTIONS', b'AVOID_ENABLE', b'AVOID_BEHAVE',
+                               b'AVOID_MARGIN', b'OA_TYPE', b'RNGFND1_TYPE', b'BATT_VOLT_MULT'):
+                        self.fc.mav.param_request_read_send(self.fc.target_system,
+                                                            self.fc.target_component, _p, -1)
                     self.fc.mav.param_set_send(self.fc.target_system, self.fc.target_component, b'DISARM_DELAY', 0, mavutil.mavlink.MAV_PARAM_TYPE_INT8)  # never auto-disarm mid-sequence
                     # APP-DRIVEN AUTO MISSIONS (SITL-found 2026-07-12): with default AUTO_OPTIONS,
                     # a mission in AUTO waits for a PILOT THROTTLE RAISE before the takeoff item —
@@ -717,6 +740,12 @@ class RadxaBridge:
             print("🔴 FC NOT DETECTED. Retrying...")
             await asyncio.sleep(2)
     async def connect_cloud(self):
+        # The control path is LOCAL by design. The bridge used to dial the public relay on
+        # every boot regardless, which both exposed the aircraft to an internet service and
+        # burned bandwidth on the flight link. Opt in explicitly if the relay is wanted.
+        if os.environ.get("ENABLE_CLOUD_RELAY", "0") in ("0", "", "false", "False"):
+            print("[LINK] Cloud relay DISABLED (set ENABLE_CLOUD_RELAY=1 to enable). Local link only.")
+            return
         while self.running:
             try:
                 print(f"☁️ Connecting to Cloud: {SERVER_URL}...")
@@ -1079,6 +1108,122 @@ class RadxaBridge:
                                       mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 9)
             print("LAND(user): goto window elapsed -> LAND mode for descent")
 
+    async def _execute_settings_command(self, cmd, payload=None):
+        """Apply an operator settings command. Single implementation shared by the local
+        link and the cloud command loop.
+
+        These previously existed ONLY inside the cloud command_loop, so over the local link
+        (the path the app and laptop actually use) every settings command fell through to
+        execute_ai_plan and became a silent no-op -- including the return-to-home destination
+        and the battery threshold that drive the auto-return failsafe.
+
+        Returns True if the command was a settings command and was handled.
+        """
+        payload = payload if isinstance(payload, dict) else {}
+
+        # SET_CONFIG:key=value -- the app's settings panel format. The VALUE must keep its
+        # original case ('user', '4k'); only the command token is upper-cased by the caller.
+        if cmd.startswith('SET_CONFIG:'):
+            config_str = cmd[len('SET_CONFIG:'):]
+            if '=' not in config_str:
+                print(f"⚠️ Malformed SET_CONFIG: {config_str}")
+                return True
+            key, val = config_str.split('=', 1)
+            cfg = {key.strip().lower(): val.strip()}
+            print(f"⚙️ SET_CONFIG: {cfg}")
+            return await self._execute_settings_command('UPDATE_CONFIG', {'config': cfg})
+
+        if cmd == 'UPDATE_CONFIG':
+            cfg = payload.get('config', {}) or {}
+            print(f"⚙️ SETTINGS UPDATED: {cfg}")
+            if 'rth_behavior' in cfg:
+                self.batt_rth_destination = 'user' if str(cfg['rth_behavior']).lower() == 'user' else 'launch'
+                print(f"⚙️ RTH DEST -> {self.batt_rth_destination}")
+            if 'land_behavior' in cfg:
+                self.land_destination = 'user' if str(cfg['land_behavior']).lower() == 'user' else 'here'
+                print(f"⚙️ LAND DEST -> {self.land_destination}")
+            for k in ('batt_threshold', 'return_battery_pct', 'rth_battery', 'low_battery_pct'):
+                if k in cfg:
+                    try:
+                        self.batt_threshold = max(5, min(50, int(float(cfg[k]))))
+                        self.return_battery_pct = self.batt_threshold
+                        self.low_batt_triggered = False
+                        self._auto_return_done = False
+                        print(f"⚙️ BATT THRESHOLD -> {self.batt_threshold}%")
+                    except Exception:
+                        pass
+            return True
+
+        if cmd == 'SET_BATT_THRESHOLD':
+            try:
+                t = int(float(payload.get('threshold', 20)))
+            except Exception:
+                t = 20
+            self.batt_threshold = max(5, min(50, t))
+            self.return_battery_pct = self.batt_threshold
+            self._auto_return_done = False
+            print(f"⚙️ BATT THRESHOLD: {self.batt_threshold}%")
+            return True
+
+        if cmd in ('SET_BATT_RTH', 'SET_RTH_BEHAVIOR'):
+            dest = str(payload.get('destination', payload.get('behavior', 'launch'))).lower()
+            self.batt_rth_destination = 'user' if dest == 'user' else ('land' if dest == 'land' else 'launch')
+            print(f"⚙️ RTH DEST: {self.batt_rth_destination}")
+            return True
+
+        if cmd == 'SET_RTH_ALT':
+            try:
+                alt_cm = int(float(payload.get('alt', 5000)))
+            except Exception:
+                alt_cm = 5000
+            print(f"⚙️ RTH ALT: {alt_cm/100.0}m")
+            if self.fc:
+                self.fc.mav.param_set_send(
+                    self.fc.target_system, self.fc.target_component,
+                    b'RTL_ALT', alt_cm, mavutil.mavlink.MAV_PARAM_TYPE_INT32)
+            return True
+
+        if cmd == 'SET_SAFETY_CONFIG':
+            oa = payload.get('obstacle_avoidance', True)
+            vp = payload.get('vision_pos', True)
+            self.telemetry_cache['obstacle_avoidance'] = oa
+            self.telemetry_cache['vision_pos'] = vp
+            print(f"⚙️ SAFETY CONFIG: obstacle_avoidance={oa}, vision_pos={vp}")
+            return True
+
+        if cmd == 'SWITCH_CAMERA':
+            target = str(payload.get('camera', 'internal')).lower()
+            self.active_cam = 'external' if target in ('external', 'gopro') else 'internal'
+            self.telemetry_cache['active_cam'] = self.active_cam
+            print(f"📷 CAMERA SWITCH: active={self.active_cam}")
+            return True
+
+        if cmd == 'SET_RECORDING_CAMERA':
+            target = str(payload.get('camera', 'internal')).lower()
+            self.recording_cam = 'external' if target in ('external', 'gopro') else 'internal'
+            print(f"🎬 RECORDING CAMERA: {self.recording_cam}")
+            return True
+
+        if cmd == 'GOPRO_SETTINGS':
+            self.gopro_settings = {**getattr(self, 'gopro_settings', {}), **payload}
+            print(f"🎥 GOPRO SETTINGS: {self.gopro_settings}")
+            return True
+
+        if cmd in ('CAPTURE', 'CAPTURE_PHOTO'):
+            print("📸 CAPTURE PHOTO")
+            if hasattr(self, 'esp32_cmd_queue') and self.esp32_cmd_queue:
+                await self.esp32_cmd_queue.put({'type': 'capture'})
+            return True
+
+        if cmd in ('START_RECORDING', 'STOP_RECORDING', 'RECORD'):
+            on = cmd != 'STOP_RECORDING'
+            self.is_recording = on
+            self.telemetry_cache['recording'] = on
+            print(f"🔴 RECORDING: {'ON' if on else 'OFF'} (cam={getattr(self, 'recording_cam', 'internal')})")
+            return True
+
+        return False
+
     async def _execute_named_command(self, cmd, cmd_payload=None):
         """Execute a NAMED flight command over the LOCAL link with the SAME MAVLink actions the cloud
         command_loop uses (LAND smart-disarm, RTL/RTH incl. batt_rth_destination, RETURN_TO_USER,
@@ -1356,9 +1501,17 @@ class RadxaBridge:
             cmd = payload if isinstance(payload, str) else (payload.get('command', '') if isinstance(payload, dict) else '')
             cmd_payload = payload.get('payload', {}) if isinstance(payload, dict) and not isinstance(payload, str) else {}
             if isinstance(cmd, str) and cmd:
-                cmd = cmd.upper().strip()
+                # Upper-case the COMMAND TOKEN only. 'SET_CONFIG:rth_behavior=user' must keep
+                # its value case: a blanket .upper() turned it into '...=USER' and '4k' into
+                # '4K', so every value the app sent arrived corrupted.
+                cmd = cmd.strip()
+                if cmd.startswith('SET_CONFIG:') or cmd.upper().startswith('SET_CONFIG:'):
+                    cmd = 'SET_CONFIG:' + cmd.split(':', 1)[1]
+                else:
+                    cmd = cmd.upper()
                 # Safety check
-                is_emergency = cmd in ['LAND', 'DISARM', 'RTL', 'UPDATE_CONFIG']
+                is_emergency = (cmd in ['LAND', 'DISARM', 'RTL', 'UPDATE_CONFIG']
+                                or cmd.startswith('SET_'))  # settings never move the aircraft
                 if not is_emergency and not self.safety.validate_auto_action(cmd):
                     print(f"🛑 SAFETY BLOCK (local): {cmd}")
                     return
@@ -1367,6 +1520,12 @@ class RadxaBridge:
                 # setpoints (vx/vy, lat/lng, mode key) -> every named command over the LOCAL link
                 # (laptop AI + app on Tailscale) was a SILENT NO-OP (only the cloud path executed them).
                 if await self._execute_named_command(cmd, cmd_payload):
+                    return
+                # Operator settings (SET_CONFIG / thresholds / camera). These used to exist only
+                # in the cloud command_loop, so over the local link they silently became bogus
+                # 'AI PLAN' actions -- the app's return destination and battery threshold never
+                # reached the failsafe.
+                if await self._execute_settings_command(cmd, cmd_payload):
                     return
                 # Not a named command -> AI plan executor (numeric setpoints) as before
                 await self.execute_ai_plan({'action': cmd, **cmd_payload})
