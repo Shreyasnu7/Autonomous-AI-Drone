@@ -783,7 +783,14 @@ class DirectorCore:
             while True:
                 try:
                     if self.spatial_grid:
-                        self._spatial_map_img = self.spatial_grid.render_map()
+                        # Only render while the grid is actually being updated. It holds its
+                        # last contents when updates stop, so the inset would otherwise keep
+                        # showing obstacles that are no longer observed.
+                        _age = time.time() - float(getattr(self.spatial_grid, 'last_update', 0) or 0)
+                        if _age <= 2.0:
+                            self._spatial_map_img = self.spatial_grid.render_map()
+                        else:
+                            self._spatial_map_img = None
                 except Exception:
                     pass
                 time.sleep(0.05)  # renders ~as fast as it can (~1-2fps); never blocks the video loop
@@ -1102,6 +1109,11 @@ class DirectorCore:
                 depth_map, _ = self.threaded_depth.get_latest()
             if depth_map is None:
                 self._subject_depth_m = 99.0    # no valid camera depth -> "far" so lidar wins
+                # Drop the cached inset too. It is only assigned when depth is valid, so a
+                # stalled depth thread left the LAST map on screen indefinitely -- and that
+                # image is part of what the pilot model reasons from, so it would have been
+                # shown a depth picture that no longer matched the scene.
+                self._latest_depth_map = None
             if depth_map is not None:
                 try:
                     # REAL METRES if a metric depth model is loaded (Depth-Anything-V2-Metric-Indoor);
