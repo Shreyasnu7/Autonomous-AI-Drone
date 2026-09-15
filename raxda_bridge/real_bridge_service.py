@@ -1652,14 +1652,41 @@ class RadxaBridge:
 
         Returns the number of route waypoints queued, or 0 if there was nothing to send.
         """
-        items = [it for it in (items or [])
-                 if isinstance(it, dict) and 'lat' in it and 'lng' in it]
+        # Validate the VALUES, not just the presence of the keys. These go straight into
+        # int(lat * 1e7): a string raises inside the read loop, NaN raises, and an out-of-range
+        # number becomes a coordinate somewhere the aircraft should never be sent.
+        def _coord(it):
+            try:
+                la = float(it.get('lat'))
+                ln = float(it.get('lng'))
+            except (TypeError, ValueError):
+                return None
+            if la != la or ln != ln:                      # NaN
+                return None
+            if not (-90.0 <= la <= 90.0) or not (-180.0 <= ln <= 180.0):
+                return None
+            if la == 0.0 and ln == 0.0:                   # null island = an unset fix
+                return None
+            return {'lat': la, 'lng': ln, 'alt': it.get('alt')}
+
+        _raw = list(items or [])
+        items = [c for c in (_coord(it) for it in _raw if isinstance(it, dict)) if c]
+        if len(items) != len(_raw):
+            print(f"⚠️ ROUTE MISSION: dropped {len(_raw) - len(items)} invalid waypoint(s)")
         if not items or not self.fc:
             return 0
 
         if alt is None:
             alt = float(os.getenv('MISSION_ALT_M', '15'))
-        alt = float(alt)
+        try:
+            alt = float(alt)
+        except (TypeError, ValueError):
+            alt = 15.0
+        _alt_max = float(os.environ.get('FENCE_ALT_MAX_M', '30'))
+        if alt != alt or alt < 1.0 or alt > _alt_max:
+            print(f"⚠️ ROUTE MISSION: altitude {alt} out of range - using 15m "
+                  f"(ceiling {_alt_max:.0f}m)")
+            alt = min(15.0, _alt_max)
         first = items[0]
 
         pm = [{'cmd': mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,   # seq0 = home placeholder
@@ -1668,7 +1695,7 @@ class RadxaBridge:
                'lat': first['lat'], 'lng': first['lng'], 'alt': alt}]
         pm += [{'cmd': mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
                 'lat': it['lat'], 'lng': it['lng'],
-                'alt': float(it.get('alt', alt))} for it in items]
+                'alt': min(max(float(it.get('alt') or alt), 1.0), _alt_max)} for it in items]
 
         self._pending_mission = pm
         self._mission_autostart = bool(autostart)
