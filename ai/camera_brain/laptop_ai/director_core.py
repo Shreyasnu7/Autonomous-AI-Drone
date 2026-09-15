@@ -1188,12 +1188,19 @@ class DirectorCore:
                     # so the band follows the real horizon instead of assuming one.
                     _vfov = 2.0 * math.atan(math.tan(hfov / 2.0) * (h_d / float(w_d)))
                     _tan_half_v = math.tan(_vfov / 2.0)
-                    _gpitch = math.radians(float(getattr(self, '_gimbal_pitch_deg', 0.0)))
+                    # TOTAL camera depression = the fixed MOUNT tilt plus whatever the gimbal
+                    # is commanding. The mount alone is 10 degrees down on this airframe, so
+                    # using the gimbal angle by itself centred the band on the optical axis --
+                    # ten degrees below the true horizon, biased into the floor, which is the
+                    # very error the band exists to avoid.
+                    _sign = float(os.getenv("GIMBAL_PITCH_SIGN", "1"))   # flip to -1 if inverted
+                    _cam_down = (math.radians(float(MOUNT.get('cam_pitch_deg', 0.0)))
+                                 + math.radians(float(getattr(self, '_gimbal_pitch_deg', 0.0))) * _sign)
 
                     def _row_for_elev(elev_rad):
-                        # elevation in BODY frame -> row index (0 = top). Camera pitch shifts it.
-                        _e = elev_rad - _gpitch
-                        _t = math.tan(max(-1.2, min(1.2, _e)))
+                        # Body-frame elevation -> row index (0 = top). A camera looking DOWN
+                        # places a given body elevation HIGHER in the frame, hence the sum.
+                        _t = math.tan(max(-1.2, min(1.2, elev_rad + _cam_down)))
                         return int(round((0.5 - (_t / (2.0 * _tan_half_v))) * h_d))
 
                     _r_top = _row_for_elev(math.radians(12.0))    # a little above the horizon
@@ -1227,7 +1234,7 @@ class DirectorCore:
                     # A steeply tilted camera (>35 deg) sees floor/ceiling, not horizontal obstacles
                     # -> skip fusing those frames (the band geometry no longer holds).
                     _gp = math.radians(float(getattr(self, '_gimbal_yaw_deg', 0.0)))
-                    _gt = abs(float(getattr(self, '_gimbal_pitch_deg', 0.0)))
+                    _gt = abs(math.degrees(_cam_down))   # total depression, mount + gimbal
                     for ix in range(0, w_d, step):
                         if _gt > 35.0:
                             break
