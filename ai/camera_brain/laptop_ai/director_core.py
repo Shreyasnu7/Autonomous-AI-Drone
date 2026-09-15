@@ -216,9 +216,22 @@ class ThreadedYOLO:
         if self.thread.is_alive():
             self.thread.join(timeout=1.0)
 
+    # Detections older than this are discarded. A frozen detection set is worse than none:
+    # the goal layer would keep steering toward a target that has left the frame, and phantom
+    # boxes would keep feeding the obstacle grid.
+    MAX_AGE_S = float(os.getenv("DET_MAX_AGE_S", "1.5"))
+
     def get_latest_detections(self):
-        """Get the most recent detection results."""
+        """Most recent detections, or None once they have gone stale."""
         with self.lock:
+            if self.latest_detections is None:
+                return None
+            if time.time() - getattr(self, '_det_t', 0.0) > self.MAX_AGE_S:
+                if not getattr(self, '_stale_warned', False):
+                    self._stale_warned = True
+                    print("⚠️ Detector stale (thread stalled or died) - discarding detections")
+                return None
+            self._stale_warned = False
             return self.latest_detections
 
     def update(self, frame):
@@ -236,12 +249,21 @@ class ThreadedYOLO:
                     self.frame = None # Consume
             
             if input_frame is not None:
-                # Inference (conf threshold honours YOLO-World's lower default)
-                results = self.model(input_frame, verbose=False, conf=self.conf)
-                new_dets = results[0].boxes
-
-                with self.lock:
-                    self.latest_detections = new_dets
+                # An exception here used to propagate out of the thread and kill it silently,
+                # after which get_latest_detections() served the SAME boxes for the rest of the
+                # flight. Keep the thread alive and let the results expire instead.
+                try:
+                    results = self.model(input_frame, verbose=False, conf=self.conf)
+                    new_dets = results[0].boxes
+                    with self.lock:
+                        self.latest_detections = new_dets
+                        self._det_t = time.time()
+                except Exception as _e:
+                    if not getattr(self, '_infer_err_warned', False):
+                        self._infer_err_warned = True
+                        print(f"⚠️ Detector inference failed ({_e}) - retrying; "
+                              f"detections will expire until it recovers")
+                    time.sleep(0.05)
             else:
                 time.sleep(0.01)
 
@@ -272,13 +294,26 @@ class ThreadedDepth:
             with self.lock:
                 self.frame = frame  # estimate() copies internally; no copy needed here
 
+    MAX_AGE_S = float(os.getenv("DEPTH_MAX_AGE_S", "2.0"))
+
+    def _fresh(self):
+        return (time.time() - getattr(self, '_depth_t', 0.0)) <= self.MAX_AGE_S
+
     def get_latest(self):
         with self.lock:
+            if not self._fresh():
+                return None, None
             return self.depth_map, self.subject_mask
 
     def get_metric(self):
-        """Latest depth in real METRES (float32 [H,W]), or None if the model is relative-only."""
+        """Latest depth in real METRES, or None if relative-only OR the map has gone stale.
+
+        A frozen depth map would let the clearance logic keep reading distances measured before
+        the aircraft moved, so it expires rather than being served indefinitely.
+        """
         with self.lock:
+            if not self._fresh():
+                return None
             return self.metric_map
 
     def stop(self):
@@ -305,6 +340,7 @@ class ThreadedDepth:
                         self.metric_map = mm
                         self.subject_mask = mask
                         self.infer_ms = (time.time() - t0) * 1000.0
+                        self._depth_t = time.time()      # freshness stamp for get_latest/get_metric
                 except Exception:
                     pass
             else:
