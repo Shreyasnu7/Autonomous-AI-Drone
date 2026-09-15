@@ -474,9 +474,38 @@ class RadxaBridge:
                 )
 
             elif has_gps:
-                lat = float(p['lat'])
-                lng = float(p['lng'])
-                alt = float(p.get('alt', 5))
+                # Validate before commanding a global position. These came straight from the
+                # packet, so a malformed plan could send the aircraft to an arbitrary coordinate
+                # anywhere on earth, and a non-numeric or NaN value raised mid-handler.
+                try:
+                    lat = float(p['lat']); lng = float(p['lng'])
+                except (TypeError, ValueError):
+                    print(f"⚠️ GOTO: non-numeric coordinate {p.get('lat')!r},{p.get('lng')!r} - ignored")
+                    return
+                if (lat != lat or lng != lng or not (-90.0 <= lat <= 90.0)
+                        or not (-180.0 <= lng <= 180.0) or (lat == 0.0 and lng == 0.0)):
+                    print(f"⚠️ GOTO: coordinate out of range ({lat},{lng}) - ignored")
+                    return
+                # Refuse a target implausibly far from where we are. The geofence would turn the
+                # aircraft back anyway, but there is no reason to launch it at one.
+                _dlat = self.telemetry_cache.get('lat'); _dlng = self.telemetry_cache.get('lng')
+                _gmax = float(os.environ.get('GOTO_MAX_DIST_M', '1000'))
+                if _dlat and _dlng:
+                    _gd = 6371000.0 * math.acos(max(-1.0, min(1.0,
+                            math.sin(math.radians(_dlat)) * math.sin(math.radians(lat)) +
+                            math.cos(math.radians(_dlat)) * math.cos(math.radians(lat)) *
+                            math.cos(math.radians(lng - _dlng)))))
+                    if _gd > _gmax:
+                        print(f"⚠️ GOTO: target {_gd:.0f} m away exceeds {_gmax:.0f} m - ignored")
+                        return
+                try:
+                    alt = float(p.get('alt', 5))
+                except (TypeError, ValueError):
+                    alt = 5.0
+                _amax = float(os.environ.get('FENCE_ALT_MAX_M', '30'))
+                if alt != alt or alt < 1.0 or alt > _amax:
+                    print(f"⚠️ GOTO: altitude {alt} out of range - using 5m (ceiling {_amax:.0f}m)")
+                    alt = min(5.0, _amax)
 
                 type_mask = (
                     0b0000_0001_11_111_000  # use position, ignore velocity & accel
