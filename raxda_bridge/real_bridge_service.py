@@ -2853,14 +2853,46 @@ class RadxaBridge:
                         _odom = (_vn * math.cos(_hr) + _ve * math.sin(_hr),      # body forward
                                  -_vn * math.sin(_hr) + _ve * math.cos(_hr))     # body right
                         px, py, pyaw = self._pose_est.update(scan, _hdg, dt=_dt, odom_vel=_odom)
+
+                        # SLAM DIVERGENCE WATCHDOG.
+                        # The correlative matcher can pin the pose in degenerate geometry -- a
+                        # featureless corridor, or a map built while stationary -- because the
+                        # scan scores highest at the position that created the map. Publishing a
+                        # FROZEN position is the dangerous outcome: the EKF believes the aircraft
+                        # is still while it flies away, and position hold then drives it further
+                        # off correcting an error that is not real. If odometry says we have
+                        # travelled and the pose has not, stop publishing rather than lie.
+                        _sp = math.hypot(_odom[0], _odom[1])
+                        _md = getattr(self, '_slam_moved', 0.0) + math.hypot(px - getattr(self, '_slam_px', px),
+                                                                             py - getattr(self, '_slam_py', py))
+                        _od = getattr(self, '_slam_odo', 0.0) + _sp * _dt
+                        self._slam_px, self._slam_py = px, py
+                        if _od > 3.0:                       # evaluate over ~3 m of travel
+                            _stuck = _md < _od * 0.25       # pose moved under a quarter of it
+                            if _stuck and not getattr(self, '_slam_bad', False):
+                                self._slam_bad = True
+                                print(f"⚠️ SLAM DIVERGENCE: odometry {_od:.1f} m but pose moved "
+                                      f"{_md:.1f} m - position estimate looks pinned. Suspending "
+                                      f"VISION_POSITION_ESTIMATE (featureless area?).")
+                            elif not _stuck and getattr(self, '_slam_bad', False):
+                                self._slam_bad = False
+                                print("✓ SLAM tracking recovered - resuming VISION_POSITION_ESTIMATE")
+                            _md = _od = 0.0
+                        self._slam_moved, self._slam_odo = _md, _od
+                        _publish_pose = not getattr(self, '_slam_bad', False)
                         _alt = float(self.telemetry_cache.get('altitude_baro',
                                      self.telemetry_cache.get('altitude', 0)) or 0)
                         # ArduPilot NED earth frame: x=North, y=East, z=Down. Our SLAM frame @heading0:
                         # x=right(East), y=forward(North) -> North=py, East=px, Down=-alt.
                         # ⚠️ frame mapping + EKF fusion need on-drone verification (Mission Planner).
-                        self.fc.mav.vision_position_estimate_send(
-                            int(_now * 1e6), py, px, -_alt, 0.0, 0.0, math.radians(pyaw))
-                        self.telemetry_cache['slam_pose'] = [round(px, 2), round(py, 2), round(pyaw, 1)]
+                        if _publish_pose:
+                            self.fc.mav.vision_position_estimate_send(
+                                int(_now * 1e6), py, px, -_alt, 0.0, 0.0, math.radians(pyaw))
+                            self.telemetry_cache['slam_pose'] = [round(px, 2), round(py, 2), round(pyaw, 1)]
+                        else:
+                            # Suspended by the divergence watchdog: better for the EKF to have no
+                            # external position than a stale one it will act on.
+                            self.telemetry_cache['slam_pose'] = None
                 except Exception:
                     pass
 
