@@ -734,10 +734,10 @@ class DirectorCore:
         self._load_cinematic_library()
         
         # Start Autonomous Logic (The "Brain")
-        asyncio.create_task(self._autonomous_reasoning_loop())
+        asyncio.create_task(self._supervised('reasoning loop', self._autonomous_reasoning_loop))
         
         # Start Continuous Sensor Fusion for Real-Time Obstacle Avoidance
-        asyncio.create_task(self._continuous_sensor_fusion())
+        asyncio.create_task(self._supervised('sensor fusion', self._continuous_sensor_fusion))
         
         print("Director: connected to messaging service and vision loop started.")
         self.autopilot.connect()
@@ -752,7 +752,7 @@ class DirectorCore:
         asyncio.create_task(self._vision_loop_supervised())
         
         # 2. Start Autonomous Brain (Idle thoughts)
-        asyncio.create_task(self._autonomous_reasoning_loop())
+        asyncio.create_task(self._supervised('reasoning loop', self._autonomous_reasoning_loop))
         
         # 3. Connect Messaging + REGISTER PACKET HANDLER
         # Without this, laptop AI NEVER receives sensor data from drone
@@ -858,6 +858,21 @@ class DirectorCore:
                 # HIDDEN: asyncio.create_task(self.process_job(syn_job))
                 pass # Disabled Idle thoughts for now
                 last_act_time = time.time() # Reset timer
+
+    async def _supervised(self, name, factory):
+        """Restart a background loop rather than let it die unnoticed (see _vision_loop_supervised)."""
+        backoff = 2.0
+        while True:
+            try:
+                await factory()
+                print(f"⚠️ {name} exited without error - restarting")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                traceback.print_exc()
+                print(f"🛑 {name} crashed - restarting in {backoff:.0f}s")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 1.5, 15.0)
 
     async def _vision_loop_supervised(self):
         """Keep the pilot alive.

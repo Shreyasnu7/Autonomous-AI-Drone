@@ -3186,14 +3186,36 @@ if __name__ == "__main__":
     try:
         async def main():
             # Run everything in parallel so Video/Cloud doesn't wait for FC
+            async def _supervise(name, factory):
+                """Keep one subsystem alive without taking the others down with it.
+
+                gather() propagates the first exception, so a fault in any single loop -- a
+                LiDAR driver hiccup, a camera error -- ended the whole bridge: MAVLink,
+                telemetry and control with it. systemd restarted the process, but that is a
+                full outage with the aircraft potentially airborne. Each loop now restarts on
+                its own and the rest keep running.
+                """
+                backoff = 2.0
+                while bridge.running:
+                    try:
+                        await factory()
+                        print(f"⚠️ {name} exited without error - restarting")
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        print(f"⚠️ {name} crashed: {e} - restarting in {backoff:.0f}s "
+                              f"(other subsystems unaffected)")
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 1.5, 20.0)
+
             await asyncio.gather(
-                bridge.connect_mavlink(),
-                bridge.connect_cloud(),
-                bridge.telemetry_loop(),  # Runs independently — NOT tied to cloud WS
-                bridge.video_loop(),
-                bridge.lidar_loop(),
-                bridge.esp32_hardware_loop(),
-                bridge.watchdog_loop(),
+                _supervise("MAVLink",    bridge.connect_mavlink),
+                _supervise("cloud",      bridge.connect_cloud),
+                _supervise("telemetry",  bridge.telemetry_loop),
+                _supervise("video",      bridge.video_loop),
+                _supervise("lidar",      bridge.lidar_loop),
+                _supervise("esp32",      bridge.esp32_hardware_loop),
+                _supervise("watchdog",   bridge.watchdog_loop),
                 bridge.start_local_server(),
                 bridge.start_local_video_server(),
                 # GoPro init used to live inside connect_cloud, so making the cloud relay
