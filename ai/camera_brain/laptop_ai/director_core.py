@@ -358,6 +358,15 @@ class DirectorCore:
         # self.esp32 = ESP32Driver() # REMOVED: Hardware is on Drone
         self.remote_esp_telem = {}
         print("✅ Director Ready for Remote ESP32 Telemetry")
+        self._esp_telem_t = 0.0
+        self._lidar_t = 0.0
+        self._lidar_max_age_s = float(os.getenv('LIDAR_MAX_AGE_S', '1.5'))
+        # Link-loss age limit for the ESP32 sensor packet. The FIRMWARE now expires a dead
+        # sensor, but if the whole link drops (the hotspot has done this repeatedly) the last
+        # packet would otherwise stay authoritative forever -- the AI would keep believing a
+        # clearance reading taken before it started moving. Beyond this age the readings are
+        # treated as absent, which every consumer already handles as "no reading".
+        self._esp_max_age_s = float(os.getenv("ESP_TELEM_MAX_AGE_S", "1.5"))
         # REMOTE SENSORS (Relayed via Bridge)
         self.remote_obstacles = [] # From Lidar (comes via websocket)
         self.lidar = YDLidarDriver() if YDLidarDriver else None # Optionally local if sensor attached
@@ -1114,7 +1123,7 @@ class DirectorCore:
             # 3c. SPATIAL GRID UPDATE — fuse all sensors into 2.5D obstacle map
             if hasattr(self, 'spatial_grid') and self.spatial_grid:
                 tof = {}
-                esp_telem = getattr(self, 'remote_esp_telem', {})
+                esp_telem = self._esp_telem()
                 if esp_telem:
                     tof = {
                         't1': esp_telem.get('t1', esp_telem.get('tof_front', -1)),
@@ -1123,7 +1132,7 @@ class DirectorCore:
                         't4': esp_telem.get('t4', esp_telem.get('tof_left', -1)),
                     }
                 self.spatial_grid.update(
-                    lidar_points=getattr(self, 'remote_obstacles', None),
+                    lidar_points=self._lidar_points(),
                     tof_sensors=tof if tof else None,
                     depth_info={'subject_depth_m': getattr(self, '_subject_depth_m', 9.9)},
                     camera_points=getattr(self, '_camera_obstacle_points', None),
@@ -1541,7 +1550,7 @@ class DirectorCore:
                     except:
                         continue
 
-                esp = getattr(self, 'remote_esp_telem', {})
+                esp = self._esp_telem()
                 gyro_data = {
                     'p': esp.get('gx', 0), 'q': esp.get('gy', 0), 'r': esp.get('gz', 0)
                 }
@@ -1643,10 +1652,14 @@ class DirectorCore:
                 # loop at ~4fps and starved telemetry. It now renders in a background thread; here we only
                 # push fresh telemetry (cheap) and display the latest cached image (instant).
                 if hasattr(self, 'spatial_grid') and self.spatial_grid:
+                    # Pass the body velocity we last COMMANDED so the obstacle memory can
+                    # ego-compensate laterally as well as forward (an orbit is lateral motion).
+                    _pv = getattr(self, '_cmd_prev', (0.0, 0.0, 0.0, 0.0))
                     self.spatial_grid.set_telemetry(
                         heading_deg=env.get('heading', 0),
                         speed=env.get('speed', 0),
                         battery=env.get('battery', 0),
+                        vx=_pv[0], vy=_pv[1],
                     )
                     if not getattr(self, '_spatial_thread_started', False):
                         self._start_spatial_render_thread()
@@ -1719,12 +1732,12 @@ class DirectorCore:
 
                 # Build environment state with ALL keys that ALL AI models expect
                 pos = self.autopilot.get_position() or [0, 0, 0]
-                esp = self.remote_esp_telem or {}
+                esp = self._esp_telem()
                 self.current_environment_state = {
                     # LiDAR — multiple key formats so all consumers find their data
-                    "lidar_obstacles": self.remote_obstacles if self.remote_obstacles else [],
-                    "lidar_scan": self.remote_obstacles if self.remote_obstacles else [],
-                    "lidar": self.remote_obstacles if self.remote_obstacles else [],
+                    "lidar_obstacles": self._lidar_points(),
+                    "lidar_scan": self._lidar_points(),
+                    "lidar": self._lidar_points(),
 
                     # ESP32 ToF sensors — BOTH naming conventions
                     # (bridge uses t1-t4, older code uses tof_front/back/left/right)
@@ -1898,12 +1911,12 @@ class DirectorCore:
             user_intent = plan.get("reasoning", "cinematic move")
             
             # --- REAL-TIME OBSTACLE FUSION (REMOTE) ---
-            obstacles = self.remote_obstacles
+            obstacles = self._lidar_points()
             if len(obstacles) > 0:
                  print(f"🛑 FUSING {len(obstacles)} REMOTE OBSTACLES!")
             
             # Fuse with Remote ESP32 Telemetry (Omnidirectional Safety)
-            telem = self.remote_esp_telem
+            telem = self._esp_telem()
             if telem:
                 SAFE_DIST = 1000 # mm
                 TILT_FACTOR = 0.707 # cos(45 degrees)
@@ -2097,12 +2110,13 @@ class DirectorCore:
                 pass # Don't crash vision loop on network glitch
             
             # 8. MPU6050 GYRO FUSION (Gimbal)
-            if self.gimbal_brain and self.remote_esp_telem:
+            _esp_now = self._esp_telem()
+            if self.gimbal_brain and _esp_now:
                 # Extract Gyro (Rad/s)
                 gyro_data = {
-                    'p': self.remote_esp_telem.get('gx', self.remote_esp_telem.get('gyro_x', 0.0)),
-                    'q': self.remote_esp_telem.get('gy', self.remote_esp_telem.get('gyro_y', 0.0)),
-                    'r': self.remote_esp_telem.get('gz', self.remote_esp_telem.get('gyro_z', 0.0))
+                    'p': _esp_now.get('gx', _esp_now.get('gyro_x', 0.0)),
+                    'q': _esp_now.get('gy', _esp_now.get('gyro_y', 0.0)),
+                    'r': _esp_now.get('gz', _esp_now.get('gyro_z', 0.0))
                 }
                 # Update Brain with Visual + Gyro
                 # Flatten detections to finding primary subject box
@@ -2206,6 +2220,7 @@ class DirectorCore:
             t = packet.get("type")
             if t == "esp32_telem":
                 self.remote_esp_telem = packet.get("payload", {})
+                self._esp_telem_t = time.time()
             elif t == "lidar_scan":
                 # Transform raw lidar points into the DRONE/FC grid frame (front=-y, right=+x),
                 # using the push-calibrated FC-forward bearing. Handles the lidar↔grid handedness.
@@ -2231,11 +2246,13 @@ class DirectorCore:
                 if LIDAR_HANDED < 0:
                     # rotation + reflection: FC-front -> (0,-1), FC-right -> (1,0)
                     self.remote_obstacles = [[sa * x - ca * y, -ca * x - sa * y] for x, y in raw_pts]
+                    self._lidar_t = time.time()
                 else:
                     # pure rotation: bring FC-front (af) to grid-front (-90°)
                     off = math.radians(-90.0 - LIDAR_FRONT_BEARING_DEG)
                     c, s = math.cos(off), math.sin(off)
                     self.remote_obstacles = [[x * c - y * s, x * s + y * c] for x, y in raw_pts]
+                    self._lidar_t = time.time()
             elif t == "ai_job":
                 self._ai_active = True  # ON-DEMAND: the AI-box message activates the brains
                 print(f"🧠 AI ACTIVATED by user message: {str(packet.get('text', packet.get('payload', '')))[:80]}")
@@ -2533,6 +2550,48 @@ class DirectorCore:
         if getattr(self, "_ra_tripped", False):
             print(f"✓ Runaway guard reset{(' (' + why + ')') if why else ''}")
         self._ra_tripped = False
+
+    def _lidar_points(self):
+        """Last LiDAR cloud, or [] once it has gone stale.
+
+        Same failure as the ESP32 packet: if the scan stream stops, the previous cloud would
+        otherwise stay authoritative for the rest of the flight. Obstacles frozen in the body
+        frame are worse than none, because the drone keeps moving relative to them -- it would
+        dodge walls that are no longer there and miss the ones that are.
+        """
+        pts = getattr(self, 'remote_obstacles', None) or []
+        if not pts:
+            return []
+        age = time.time() - getattr(self, '_lidar_t', 0.0)
+        if age > getattr(self, '_lidar_max_age_s', 1.5):
+            if not getattr(self, '_lidar_stale_warned', False):
+                self._lidar_stale_warned = True
+                print(f"⚠️ LiDAR cloud stale ({age:.1f}s) - discarding, flying on ToF/camera only")
+            return []
+        if getattr(self, '_lidar_stale_warned', False):
+            self._lidar_stale_warned = False
+            print("✓ LiDAR cloud live again")
+        return pts
+
+    def _esp_telem(self):
+        """ESP32 sensor packet, or {} if it has gone stale (link dropped).
+
+        Consumers must not distinguish "sensor says 4 m clear" from "we have not heard from the
+        sensor board since before we started moving". Returning {} collapses the second case to
+        "no reading", which the clearance logic already treats conservatively.
+        """
+        if not self.remote_esp_telem:
+            return {}
+        age = time.time() - getattr(self, '_esp_telem_t', 0.0)
+        if age > getattr(self, '_esp_max_age_s', 1.5):
+            if not getattr(self, '_esp_stale_warned', False):
+                self._esp_stale_warned = True
+                print(f"⚠️ ESP32 telemetry stale ({age:.1f}s) - treating ToF/IMU as absent")
+            return {}
+        if getattr(self, '_esp_stale_warned', False):
+            self._esp_stale_warned = False
+            print("✓ ESP32 telemetry live again")
+        return self.remote_esp_telem
 
     def _caution_radius_m(self, speed):
         """Velocity-adaptive caution radius: standoff + reaction distance + braking distance,
@@ -2863,7 +2922,7 @@ class DirectorCore:
             pts = []
             for p in (getattr(self, '_camera_obstacle_points', None) or []):
                 pts.append((float(p[0]), -float(p[1])))
-            for p in (getattr(self, 'remote_obstacles', None) or []):
+            for p in self._lidar_points():
                 if isinstance(p, (list, tuple)) and len(p) >= 2:
                     pts.append((float(p[0]), -float(p[1])))
             cm.rebuild(pts)
@@ -3257,7 +3316,7 @@ class DirectorCore:
         if dm is None:
             return 1.0
         try:
-            tof_mm = float((self.remote_esp_telem or {}).get('tof_front'))
+            tof_mm = float((self._esp_telem() or {}).get('tof_front'))
             if not tof_mm or tof_mm <= 0:
                 return 1.0
             h, w = dm.shape[:2]
@@ -3380,7 +3439,7 @@ class DirectorCore:
 
             full_sensor_context = {
                 "lidar_obstacles": self.remote_obstacles, # [[x,y], [x,y]]
-                "tof_sensors": self.remote_esp_telem, # {"tof_front": 1200, ...}
+                "tof_sensors": self._esp_telem(), # {"tof_front": 1200, ...}
                 "objects": objects_ranged,            # [{label, distance_m, bearing, conf}] depth↔ToF fused
                 "has_camera": frame is not None,
                 "perception_note": ("LIVE image attached + per-object distances (depth↔ToF fused)"

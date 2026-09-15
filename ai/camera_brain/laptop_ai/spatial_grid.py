@@ -90,9 +90,17 @@ class SpatialGrid:
         dyaw = (drone_yaw_rad - self._prev_yaw) if self._prev_yaw is not None else 0.0
         if self._mem:
             # rotation compensation is dt-independent (a yaw is a yaw); only translation needs dt
-            fwd = self._speed * dt                  # forward motion -> obstacles slide toward +y (back)
+            # Translate by the ACTUAL body velocity, not just a forward magnitude.
+            # Grid convention: forward = -y, right = +x. So moving forward pushes remembered
+            # obstacles toward +y (behind us); moving right pushes them toward -x.
+            _vx = getattr(self, '_vx', None)
+            _vy = getattr(self, '_vy', None)
+            if _vx is None and _vy is None:
+                _vx, _vy = self._speed, 0.0          # legacy fallback: assume forward
+            fwd = (_vx or 0.0) * dt                  # -> obstacles slide toward +y (back)
+            lat = (_vy or 0.0) * dt                  # -> obstacles slide toward -x (left)
             c, s = math.cos(-dyaw), math.sin(-dyaw)  # drone yawed by dyaw -> rotate points opposite
-            self._mem = [(x*c - y*s, x*s + y*c + fwd, t) for x, y, t in self._mem
+            self._mem = [(x*c - y*s - lat, x*s + y*c + fwd, t) for x, y, t in self._mem
                          if now - t <= self.MEM_SECS]
         if camera_points:
             # fresh camera data replaces memory inside the freshly-observed wedge
@@ -291,11 +299,20 @@ class SpatialGrid:
             return True          # known direction, nothing recorded there = clear
         return self._obstacle_summary[key] >= min_distance_cm
 
-    def set_telemetry(self, heading_deg=0, speed=0, battery=0):
-        """Update telemetry for HUD overlay."""
+    def set_telemetry(self, heading_deg=0, speed=0, battery=0, vx=None, vy=None):
+        """Update telemetry. vx/vy are BODY velocity (forward+, right+) in m/s.
+
+        The obstacle memory is ego-compensated with these. It used to receive only scalar ground
+        speed and assume the motion was entirely FORWARD, so any lateral or rearward movement
+        slid remembered obstacles the wrong way -- and since an orbit is built from sustained
+        lateral motion, the memory smeared exactly during the manoeuvre it matters most for.
+        Falls back to the old forward-only assumption when vx/vy are not supplied.
+        """
         self._heading_deg = heading_deg
         self._speed = speed
         self._battery = battery
+        self._vx = vx
+        self._vy = vy
 
     def _m_to_px(self, mx, my):
         """Convert meters (drone-centered) to pixel coords on the flat map (legacy)."""
