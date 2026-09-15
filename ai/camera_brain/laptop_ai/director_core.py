@@ -1437,6 +1437,22 @@ class DirectorCore:
                             # Jerk-limit ONLY (the AI's vx/vy/vz/yaw choice is untouched as a target) so
                             # the airframe ramps smoothly — no burst, no abrupt change. Hover=0 vel keeps
                             # motors spinning (never zero-RPM in air).
+                            # Commanding into a dead link is not flying. The aircraft itself is
+                            # safe (its RC override expires in ~3 s and it holds), but the pilot
+                            # would otherwise keep issuing intents and reporting progress on a
+                            # mission that is not reaching it. Hold and say so instead.
+                            _ws = getattr(self, 'ws', None)
+                            if _ws is not None and not getattr(_ws, 'connected', True):
+                                if not getattr(self, '_link_down_warned', False):
+                                    self._link_down_warned = True
+                                    print("⚠️ LINK DOWN to the aircraft - withholding commands "
+                                          "(it holds on RC-override expiry). Mission is NOT progressing.")
+                                self._runaway_reset('link restored')
+                                svx = svy = svz = 0.0
+                            elif getattr(self, '_link_down_warned', False):
+                                self._link_down_warned = False
+                                print("✓ Link to the aircraft restored")
+
                             # Bound a confidently-wrong heading (works with no GPS/obstacles).
                             svx, svy, svz = self._runaway_check(svx, svy, svz)
                             svx, svy, svz, byaw = self._smooth_cmd(svx, svy, svz, byaw)
