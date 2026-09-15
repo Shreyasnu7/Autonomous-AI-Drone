@@ -1480,6 +1480,32 @@ class DirectorCore:
                                     _dist = float(_mm_o[_py, _px]) * _scale
                                 else:
                                     _dist = _r2m(_dm[_py, _px]) * _scale
+
+                                # PHYSICAL SIZE. The pilot was told what an object is and how far
+                                # away, but never how BIG -- so a 0.7 m gap and a 2.5 m gap in the
+                                # same doorway class were indistinguishable, and "fits" was not a
+                                # judgement it could make. With the depth and the focal length the
+                                # box subtends a real size: size = (pixels / f) * distance.
+                                try:
+                                    _fpx = (_fw / 2.0) / math.tan(math.radians(
+                                        MOUNT.get('cam_hfov_deg', 86.0)) / 2.0)
+                                    _bw = abs(float(bx[2]) - float(bx[0]))
+                                    _bh = abs(float(bx[3]) - float(bx[1]))
+                                    if _fpx > 1 and 0.05 < _dist < 30.0:
+                                        _wm = (_bw / _fpx) * _dist
+                                        _hm = (_bh / _fpx) * _dist
+                                        # A box touching the frame edge is CLIPPED, so its true
+                                        # extent is unknown -- report the visible part as a lower
+                                        # bound rather than a measurement the pilot would trust.
+                                        _clip = (float(bx[0]) <= 1 or float(bx[1]) <= 1
+                                                 or float(bx[2]) >= _fw - 2 or float(bx[3]) >= _fh - 2)
+                                        if 0.01 < _wm < 50 and 0.01 < _hm < 50:
+                                            _o["width_m"] = round(_wm, 2)
+                                            _o["height_m"] = round(_hm, 2)
+                                            if _clip:
+                                                _o["size_clipped"] = True
+                                except Exception:
+                                    pass
                                 _o["distance_m"] = round(min(_dist, 30.0), 2)
                                 _o["bearing"] = "front-left" if _cxp < 0.38 else ("front-right" if _cxp > 0.62 else "center")
                             if hasattr(d, 'xyxy'):
@@ -3353,6 +3379,8 @@ class DirectorCore:
                 lbl = str(o.get("class", "?"))
                 if o.get("distance_m") is not None:
                     lbl += f" {o['distance_m']}m"
+                if o.get("width_m") is not None:
+                    lbl += f" {o['width_m']}x{o.get('height_m')}m" + ("+" if o.get("size_clipped") else "")
                 cv2.putText(img, lbl, (x1, max(12, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
             # ToF directional distances at the 4 edges (cm)
             def _tf(k1, k2):

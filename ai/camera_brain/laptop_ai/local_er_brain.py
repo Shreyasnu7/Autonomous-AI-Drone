@@ -698,8 +698,13 @@ class LocalERBrain:
                 s = f"{d['class']} ({d.get('confidence', 0):.2f})"
                 if d.get('distance_m') is not None:
                     s += f" @ {d['distance_m']}m {d.get('bearing', '')}".rstrip()
+                # Physical size, so "does it fit" is answerable. A box touching the frame edge
+                # is clipped, so its extent is a lower bound, not a measurement.
+                if d.get('width_m') is not None:
+                    s += f" [{d['width_m']}x{d.get('height_m')}m{'+' if d.get('size_clipped') else ''}]"
                 dets.append(s)
-            lines.append(f"OBJECTS (label, conf, distance): {', '.join(dets)}")
+            lines.append("OBJECTS (label, conf, distance, [width x height in metres; "
+                         "'+' = extends past the frame edge]): " + ", ".join(dets))
 
         return "\n".join(lines)
 
