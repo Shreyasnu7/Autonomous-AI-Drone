@@ -195,7 +195,7 @@ Honesty matters more than the pitch here, so two constraints are worth stating p
 - **GPS-denied indoor operation** — 2D LiDAR SLAM produces `VISION_POSITION_ESTIMATE` for the EKF; velocity is delivered as ALT_HOLD attitude override when no position fix exists
 - **Map route missions** — waypoints tapped on a map are uploaded via the MAVLink mission protocol and flown in AUTO with native avoidance
 - **Operator-defined return policy** — return-to-home / return-to-operator / land-in-place, at an operator-defined battery threshold
-- **Motion-triangulation depth anchoring** — camera motion parallax refines monocular depth scale toward centimetre class
+- **Motion-triangulation depth anchoring** — camera motion parallax recovers the metric scale of monocular depth (≈5 cm at 2 m, degrading with the square of range)
 
 ### Applicable domains
 

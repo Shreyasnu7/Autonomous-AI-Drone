@@ -151,7 +151,7 @@ Monocular metric depth carries 2–10% scale error. Because the aircraft is alwa
 Z = (a · f_t) / (f_t · f_t),    a = (u·t_z − f·t_x,  v·t_z − f·t_y)
 ```
 
-The median ratio of triangulated to model depth becomes a robust scale correction. Error scales as `σ_Z ≈ Z²·σ_px / (f·B)` — approximately 1.5 cm at 2 m with a 30 cm baseline. The estimator returns no correction unless baseline, parallax and inlier count all pass thresholds, falling back to the time-of-flight anchor.
+The median ratio of triangulated to model depth becomes a robust scale correction. Error scales as `σ_Z ≈ Z²·σ_px / (f·B)`, with `f = (w/2)/tan(HFOV/2)`. At the configured 86° HFOV and a 512-wide depth map, `f ≈ 275 px`, giving **≈ 5 cm at 2 m and ≈ 30 cm at 5 m** with a 30 cm baseline — and ≈ 10 cm at 2 m on a 256-wide map. Because the error grows with the square of range, distant depth is coarse and is treated as such by the clearance logic. The estimator returns no correction unless baseline, parallax and inlier count all pass thresholds, falling back to the time-of-flight anchor.
 
 ---
 

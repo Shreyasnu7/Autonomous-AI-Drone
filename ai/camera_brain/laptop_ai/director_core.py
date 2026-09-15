@@ -2193,6 +2193,22 @@ class DirectorCore:
                 # Transform raw lidar points into the DRONE/FC grid frame (front=-y, right=+x),
                 # using the push-calibrated FC-forward bearing. Handles the lidar↔grid handedness.
                 raw_pts = packet.get("payload", {}).get("points", [])
+                # CONSISTENCY CHECK. The bridge mirrors the ring for ArduPilot using its own
+                # LIDAR_DIR; we mirror the same raw points for the AI grid using LIDAR_HANDED.
+                # They are separate variables in separate processes, so a bench calibration that
+                # flips one and not the other leaves the flight controller avoiding obstacles on
+                # the opposite side from where the AI believes they are. Warn once if they differ.
+                _conv = (packet.get('payload') or {}).get('conv') if isinstance(packet.get('payload'), dict) else None
+                if _conv and not getattr(self, '_lidar_conv_checked', False):
+                    self._lidar_conv_checked = True
+                    _bdir = int(_conv.get('dir', LIDAR_HANDED))
+                    if _bdir != LIDAR_HANDED:
+                        print(f"⚠️  LIDAR HANDEDNESS MISMATCH: bridge LIDAR_DIR={_bdir} but "
+                              f"laptop LIDAR_HANDED={LIDAR_HANDED}. ArduPilot avoidance and the AI "
+                              f"spatial grid will mirror obstacles oppositely. Set them to match.")
+                    else:
+                        print(f"✓ LiDAR convention agrees with bridge (dir={_bdir}, "
+                              f"front bearing {LIDAR_FRONT_BEARING_DEG}deg)")
                 af = math.radians(LIDAR_FRONT_BEARING_DEG)
                 sa, ca = math.sin(af), math.cos(af)
                 if LIDAR_HANDED < 0:

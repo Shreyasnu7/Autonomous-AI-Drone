@@ -2709,7 +2709,15 @@ class RadxaBridge:
                      if lidar_points:
                          step = max(1, len(lidar_points) // 400)  # 400 pts/scan: precision cloud (was 200)
                          sampled = lidar_points[::step]
-                         scan_msg = json.dumps({"type": "lidar_scan", "payload": {"points": sampled}})
+                         scan_msg = json.dumps({"type": "lidar_scan", "payload": {
+                             "points": sampled,
+                             # The points above are RAW (range*cos, range*sin). This bridge and
+                             # the laptop grid each apply their OWN mirror/rotation to them, from
+                             # different variables in different processes. If those disagree,
+                             # ArduPilot avoids one way while the AI believes the obstacle is on
+                             # the opposite side. Publish ours so the consumer can check.
+                             "conv": {"dir": int(getattr(self, "LIDAR_DIR", -1)),
+                                      "yaw_off": float(os.getenv("LIDAR_YAW_OFFSET_DEG", "0"))}}})
                          if self.ws:
                              try: await self.ws.send(scan_msg)
                              except: pass
@@ -2798,7 +2806,15 @@ class RadxaBridge:
                 if lidar_points:
                     step = max(1, len(lidar_points) // 400)  # 400 pts/scan: precision cloud (was 200)
                     sampled = lidar_points[::step]
-                    scan_msg = json.dumps({"type": "lidar_scan", "payload": {"points": sampled}})
+                    scan_msg = json.dumps({"type": "lidar_scan", "payload": {
+                             "points": sampled,
+                             # The points above are RAW (range*cos, range*sin). This bridge and
+                             # the laptop grid each apply their OWN mirror/rotation to them, from
+                             # different variables in different processes. If those disagree,
+                             # ArduPilot avoids one way while the AI believes the obstacle is on
+                             # the opposite side. Publish ours so the consumer can check.
+                             "conv": {"dir": int(getattr(self, "LIDAR_DIR", -1)),
+                                      "yaw_off": float(os.getenv("LIDAR_YAW_OFFSET_DEG", "0"))}}})
                     if self.ws:
                         try: await self.ws.send(scan_msg)
                         except: pass

@@ -10,8 +10,11 @@ the TRANSLATIONAL flow and the known baseline (the drone's own motion). The medi
     flow_t = ( (u*t_z - f*t_x) / Z,  (v*t_z - f*t_y) / Z )      (pinhole, camera frame)
     =>  Z_i = (a . flow_t) / (flow_t . flow_t),  a = (u*t_z - f*t_x,  v*t_z - f*t_y)
 
-Physics of the precision: sigma_Z ~ Z^2 * sigma_px / (f * B). GoPro (f~450px @512w), B=0.3m:
-~1.5cm at 2m, ~9cm at 5m — cm-class, NOT mm (mm-from-video at range is marketing).
+Physics of the precision: sigma_Z ~ Z^2 * sigma_px / (f * B), where f = (w/2)/tan(hfov/2).
+At the configured 86 deg HFOV the focal length is ~275px on a 512-wide depth map (NOT ~450px --
+that would need a ~59 deg lens), so with B=0.3m and sigma_px=1: ~5cm at 2m, ~30cm at 5m. On a
+256-wide map f~137px and it is ~10cm at 2m. Decimetre-class at working range, not centimetre --
+and it degrades with the SQUARE of distance, so treat far readings as coarse.
 
 Fail-safe: returns None when there is not enough baseline (<2cm) or parallax (<1.5px median)
 or too few tracked inliers — callers fall back to the ToF anchor / neutral 1.0."""

@@ -20,6 +20,9 @@ import math
 import time
 import cv2
 import numpy as np
+import logging
+
+logger = logging.getLogger('SpatialGrid')
 
 
 class SpatialGrid:
@@ -263,9 +266,30 @@ class SpatialGrid:
         """Returns flat list of 100 ints (0/1) for numeric consumers like Pi0."""
         return [cell for row in self.grid for cell in row]
 
+    # The summary is keyed front/back/left/right, but the pilot vocabulary elsewhere in the
+    # system is fwd/back/left/right (_HEAD_AZ). Map both so a caller cannot miss by a synonym.
+    _DIR_ALIASES = {
+        "fwd": "front", "forward": "front", "ahead": "front", "f": "front", "front": "front",
+        "back": "back", "backward": "back", "behind": "back", "rear": "back", "b": "back",
+        "left": "left", "port": "left", "l": "left",
+        "right": "right", "starboard": "right", "r": "right",
+    }
+
     def is_direction_clear(self, direction, min_distance_cm=200.0):
-        """Check if a direction is clear of obstacles within min_distance_cm (centimeters)."""
-        return self._obstacle_summary.get(direction, 9999) >= min_distance_cm
+        """True if `direction` is clear of obstacles beyond min_distance_cm.
+
+        Fails CLOSED. This previously defaulted an unrecognised key to 9999 cm, so asking about
+        'fwd' -- the word the pilot model and resolver actually use -- reported CLEAR while the
+        grid held an obstacle at 120 cm in front. A safety predicate must not answer "clear"
+        for a question it did not understand.
+        """
+        key = self._DIR_ALIASES.get(str(direction or "").lower().strip())
+        if key is None:
+            logger.warning(f"is_direction_clear: unknown direction {direction!r} -> reporting BLOCKED")
+            return False
+        if key not in self._obstacle_summary:
+            return True          # known direction, nothing recorded there = clear
+        return self._obstacle_summary[key] >= min_distance_cm
 
     def set_telemetry(self, heading_deg=0, speed=0, battery=0):
         """Update telemetry for HUD overlay."""
