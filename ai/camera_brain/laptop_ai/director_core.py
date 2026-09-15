@@ -89,6 +89,8 @@ from laptop_ai.deepstream_handler import DeepStreamHandler
 from laptop_ai.pi0_pilot import Pi0Pilot
 from laptop_ai.gemini_live_brain import GeminiLiveBrain
 from laptop_ai.local_er_brain import LocalERBrain  # Qwen 2.5 VL 3B local pilot
+from laptop_ai.spherical_memory import SphericalMemory   # azimuth x elevation dome
+from laptop_ai.dome_scan import DomeScanner              # decides where to LOOK
 from laptop_ai import hybrid_control  # deterministic maneuver library + sequencer (AI=intent, code=precise)
 # Add cloud_ai path if needed, or assume relative import works if cloud_ai is sibling
 try:
@@ -738,6 +740,14 @@ class DirectorCore:
         except ImportError:
             self.spatial_grid = None
         self._spatial_map_img = None
+        # DOME: the flat grid is one horizontal slice, so it cannot say whether something is
+        # above or below the flight path. This accumulates the LiDAR ring (tagged with the
+        # attitude the aircraft already has) and the camera cone (tagged with where the gimbal
+        # is actually pointing) into one azimuth x elevation picture that outlives a glance.
+        self.dome = SphericalMemory()
+        self.dome_scan = DomeScanner()
+        self._dome_prev_yaw = None
+        self._dome_prev_t = None
         self._spatial_thread_started = False
 
         print(f"Advanced AI Models Instantiated (Pi0: {self.pi0_pilot.model_type}, DS: {self.deepstream.mode}, Brain: ONLINE)")
@@ -1341,6 +1351,38 @@ class DirectorCore:
                     drone_yaw_rad=env.get('yaw', 0),
                 )
                 # Inject spatial description into environment for all AIs
+                # --- DOME: accumulate the same sensors across ELEVATION ---
+                # The LiDAR ring is tagged with the attitude the aircraft ALREADY has, so simply
+                # flying - which constantly pitches and rolls the airframe - sweeps the plane
+                # through elevation and builds a dome for free. No extra command, no risk.
+                try:
+                    _now_d = time.time()
+                    _dyaw = 0.0
+                    if self._dome_prev_yaw is not None:
+                        _dyaw = float(env.get('yaw', 0) or 0) - self._dome_prev_yaw
+                        _dyaw = (_dyaw + math.pi) % (2 * math.pi) - math.pi     # shortest way round
+                    _ddt = (_now_d - self._dome_prev_t) if self._dome_prev_t else 0.0
+                    _ddt = max(0.0, min(0.5, _ddt))
+                    self._dome_prev_yaw = float(env.get('yaw', 0) or 0)
+                    self._dome_prev_t = _now_d
+                    _pv_d = getattr(self, '_cmd_prev', (0.0, 0.0, 0.0, 0.0))
+                    self.dome.update_ego(dyaw_rad=_dyaw,
+                                         fwd_m=_pv_d[0] * _ddt, right_m=_pv_d[1] * _ddt,
+                                         now=_now_d)
+                    self.dome.add_lidar_ring(self._lidar_points(),
+                                             roll_deg=math.degrees(float(env.get('roll', 0) or 0)),
+                                             pitch_deg=math.degrees(float(env.get('pitch', 0) or 0)),
+                                             now=_now_d)
+                    # Camera returns carry the gimbal's elevation, which is what makes sweeping
+                    # the gimbal worth anything: it aims the cone at a part of the dome the
+                    # LiDAR plane can never reach.
+                    self.dome.add_camera_cone(getattr(self, '_camera_obstacle_points', None),
+                                              gimbal_pitch_deg=-float(getattr(self, '_gimbal_pitch_deg', 0.0)),
+                                              now=_now_d)
+                    env['dome'] = self.dome.describe()
+                    env['dome_coverage'] = round(self.dome.coverage(), 3)
+                except Exception:
+                    pass
                 env['spatial'] = self.spatial_grid.get_spatial_description()
                 env['spatial_closest_m'], env['spatial_closest_dir'] = self.spatial_grid.get_closest_obstacle()
 
@@ -1665,8 +1707,26 @@ class DirectorCore:
                             if not self._manage_flight_mode(svx, svy, svz):
                                 self.autopilot.send_velocity(svx, svy, svz, yaw_rate=byaw)
 
-                        # Apply ER gimbal
+                        # ACTIVE LOOKING. If the pilot did not ask the gimbal for anything this
+                        # tick, and there is no subject to hold, point it at a part of the dome we
+                        # have not measured. The scan yields the moment a real task wants the
+                        # camera back -- a sweep is never more important than what the aircraft is
+                        # actually doing.
                         gimbal = decision.get('gimbal', {})
+                        if not gimbal and hasattr(self.autopilot, 'set_gimbal'):
+                            try:
+                                _busy = bool(getattr(self, '_mission_target', None)) or                                         time.time() < getattr(self, '_command_until', 0.0)
+                                _travel_az = (math.degrees(math.atan2(bvy, bvx))
+                                              if (abs(bvx) + abs(bvy)) > 0.05 else None)
+                                _aim = self.dome_scan.next_gimbal(self.dome, busy=_busy,
+                                                                  travel_az_deg=_travel_az)
+                                if _aim is not None:
+                                    self.autopilot.set_gimbal(_aim[0], _aim[1])
+                                    self._gimbal_pitch_deg, self._gimbal_yaw_deg = _aim[0], _aim[1]
+                            except Exception:
+                                pass
+
+                        # Apply ER gimbal
                         if gimbal and hasattr(self.autopilot, 'set_gimbal'):
                             pitch = float(gimbal.get('pitch', 0))
                             yaw_g = float(gimbal.get('yaw', 0))

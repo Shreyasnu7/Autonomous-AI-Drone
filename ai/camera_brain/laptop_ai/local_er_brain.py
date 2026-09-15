@@ -649,6 +649,13 @@ class LocalERBrain:
         _tl = sensors.get('t4', sensors.get('tof_left'))
         if any(v not in (None, 9999, -1) for v in (_tf, _tr, _tb, _tl)):
             lines.append(f"ToF (cm): F={_tf}, R={_tr}, B={_tb}, L={_tl}")
+        # The DOME: what is known above and below the flight path, not just in the LiDAR's
+        # single horizontal plane. Coverage is stated so the pilot can tell a genuinely clear
+        # direction from one nothing has looked at yet.
+        if sensors.get('dome'):
+            lines.append(sensors['dome'])
+            lines.append("(a direction missing from the dome is UNOBSERVED, not clear - "
+                         "if it matters, turn or look before committing to it)")
         if sensors.get('lidar_min_dist'):
             lines.append(f"Lidar Min Dist: {sensors['lidar_min_dist']}cm at {sensors.get('lidar_min_angle')}deg")
         if sensors.get('altitude'):
