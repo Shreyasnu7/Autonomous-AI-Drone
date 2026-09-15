@@ -1049,8 +1049,11 @@ class _ControlScreenState extends State<ControlScreen> with TickerProviderStateM
                                setState(() => leftStick = v);
                                if (context.mounted) {
                                   // P1.5: Apply Sensitivity
+                                  // Full stick range; sensitivity shapes the curve instead of
+                                  // capping authority (see sendJoystick).
                                   final sens = (context.read<CentralState>().config['sensitivity'] ?? 0.7).toDouble();
-                                  context.read<CentralState>().telemetry.sendControl(0, 0, -v.dy * sens, v.dx * sens);
+                                  context.read<CentralState>().telemetry.sendControl(
+                                      0, 0, -v.dy, v.dx, expo: (1.0 - sens).clamp(0.0, 0.8));
                                }
                              }
                            ),
@@ -1088,7 +1091,8 @@ class _ControlScreenState extends State<ControlScreen> with TickerProviderStateM
                                 setState(() => rightStick = v);
                                 // MA-1 FIX: Apply sensitivity multiplier (left stick has it, right was missing)
                                 final sens = (context.read<CentralState>().config['sensitivity'] ?? 0.7).toDouble();
-                                context.read<CentralState>().telemetry.sendControl(v.dx * sens, -v.dy * sens, 0, 0);
+                                context.read<CentralState>().telemetry.sendControl(
+                                    v.dx, -v.dy, 0, 0, expo: (1.0 - sens).clamp(0.0, 0.8));
                               }
                             ),
                           ),

@@ -1774,7 +1774,7 @@ class RadxaBridge:
                 # int that packs into a uint16 near 65535 -- which MAVLink reads as "ignore this
                 # channel", so a malformed packet could silently drop an axis instead of
                 # centring it. Stick input is normalised to [-1, 1] first.
-                def map_ch(val, center=True):
+                def map_ch(val, center=True, invert=False):
                     try:
                         val = float(val)
                     except (TypeError, ValueError):
@@ -1782,16 +1782,59 @@ class RadxaBridge:
                     if val != val:                      # NaN
                         val = 0.0
                     val = max(-1.0, min(1.0, val))
+                    if invert:
+                        val = -val
                     raw = (1500 + val * 500) if center else (1000 + val * 1000)
                     return int(max(1000, min(2000, raw)))
 
-                raw_roll  = float(payload.get('x', 0))
-                raw_pitch = float(payload.get('y', 0))
-                raw_thr   = float(payload.get('z', 0))
-                raw_yaw   = float(payload.get('r', 0))
+                # RC FEEL. The cloud path already shaped its sticks; this one -- the path the
+                # application actually uses -- passed them through raw, so control was linear
+                # from centre to stop: twitchy in the middle where fine corrections are made,
+                # with no more authority at the edge. A cubic expo keeps full deflection while
+                # softening the centre, which is what a transmitter does and why they feel
+                # precise. The small deadzone stops a resting thumb from drifting the aircraft.
+                def _dz(v, dz=0.03):
+                    try:
+                        v = float(v)
+                    except (TypeError, ValueError):
+                        return 0.0
+                    if v != v:
+                        return 0.0
+                    return 0.0 if abs(v) < dz else v
 
+                # The application sends its own shaping strength so the operator's sensitivity
+                # setting actually does something, and shaping happens in exactly ONE place
+                # rather than compounding at both ends. Older clients omit it and get the default.
+                try:
+                    _pkt_expo = float(payload.get('expo'))
+                    if _pkt_expo != _pkt_expo:
+                        _pkt_expo = None
+                    else:
+                        _pkt_expo = max(0.0, min(0.8, _pkt_expo))
+                except (TypeError, ValueError):
+                    _pkt_expo = None
+
+                def _expo(v, e=None):
+                    if e is None:
+                        e = _pkt_expo if _pkt_expo is not None else float(os.environ.get('STICK_EXPO', '0.35'))
+                    sgn = 1.0 if v >= 0 else -1.0
+                    a = min(1.0, abs(v))
+                    return sgn * ((1.0 - e) * a + e * (a ** 3))
+
+                raw_roll  = _expo(_dz(payload.get('x', 0)))
+                raw_pitch = _expo(_dz(payload.get('y', 0)))
+                raw_thr   = _dz(payload.get('z', 0))      # throttle stays LINEAR: expo on the
+                                                          # climb axis makes altitude hard to hold
+                raw_yaw   = _expo(_dz(payload.get('r', 0)))
+
+                # PITCH IS INVERTED ON PURPOSE.
+                # ArduPilot's RC2 raises the nose as the PWM rises, so FORWARD flight is BELOW
+                # centre. The AI path has always had this right -- it sends rc2 = 1500 - vx*250 --
+                # but the stick path passed its value straight through, so pushing the stick
+                # forward commanded 1850 and flew the aircraft BACKWARD. Two paths driving one
+                # channel in opposite directions is the sloppy, unpredictable handling this had.
                 rc1 = map_ch(raw_roll)
-                rc2 = map_ch(raw_pitch)
+                rc2 = map_ch(raw_pitch, invert=True)
                 rc3 = map_ch(raw_thr)
                 rc4 = map_ch(raw_yaw)
 
@@ -2304,7 +2347,9 @@ class RadxaBridge:
 
                         # Map to RC PWM (1000-2000, center 1500)
                         target_rc1 = map_ch(raw_roll, center=True)    # RC1 = Roll
-                        target_rc2 = map_ch(raw_pitch, center=True)   # RC2 = Pitch
+                        # Inverted for the same reason as the local path: ArduPilot's RC2 raises
+                        # the nose as PWM rises, so forward is BELOW centre.
+                        target_rc2 = map_ch(raw_pitch, center=True, invert=True)   # RC2 = Pitch
                         target_rc3 = map_ch(raw_thr, center=True)     # RC3 = Throttle
                         target_rc4 = map_ch(raw_yaw, center=True)     # RC4 = Yaw
 

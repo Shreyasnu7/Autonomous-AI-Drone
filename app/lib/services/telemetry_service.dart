@@ -137,17 +137,25 @@ class TelemetryService {
     });
   }
 
-  void sendJoystick(double x, double y, double z, double r) {
+  /// Stick input, full range. `expo` is the SHAPING strength, not a limit.
+  ///
+  /// Sensitivity used to be applied as a plain multiplier, so a setting of 0.7 meant full
+  /// deflection could only ever command 70% authority -- the aircraft simply could not be asked
+  /// for everything it had, and the centre stayed as twitchy as before. It now travels as a
+  /// curve parameter: the centre is softened for fine corrections while full stick still means
+  /// full stick, which is how a transmitter behaves.
+  void sendJoystick(double x, double y, double z, double r, {double expo = 0.35}) {
     if (_isConnected && _channel != null) {
       _channel!.sink.add(jsonEncode({
         "type": "joystick",
-        "payload": {"x": x, "y": y, "z": z, "r": r}
+        "payload": {"x": x, "y": y, "z": z, "r": r, "expo": expo}
       }));
     }
   }
 
   // Alias for legacy calls
-  void sendControl(double x, double y, double z, double r) => sendJoystick(x, y, z, r);
+  void sendControl(double x, double y, double z, double r, {double expo = 0.35}) =>
+      sendJoystick(x, y, z, r, expo: expo);
   
   void sendMission(List<dynamic> waypoints) {
     if (_isConnected && _channel != null) {
