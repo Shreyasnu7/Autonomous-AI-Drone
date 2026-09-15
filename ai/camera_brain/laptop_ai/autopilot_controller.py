@@ -1,5 +1,6 @@
 
 import asyncio
+import os
 import time
 from pymavlink import mavutil
 
@@ -60,6 +61,7 @@ class AutopilotController:
         if packet.get("type") == "telemetry":
             # Bridge sends under "payload", older code used "data" — handle both
             self.latest_telem = packet.get("payload", packet.get("data", {}))
+            self._telem_t = time.time()
         elif packet.get("type") == "esp32_telem":
             # ESP32 sensor data — store for DirectorCore to read
             self.latest_esp32 = packet.get("payload", {})
@@ -272,13 +274,26 @@ class AutopilotController:
             mavutil.mavlink.MAV_MOUNT_MODE_MAVLINK_TARGETING
         )
 
+    # Telemetry older than this is not reported. Serving it would let callers act on a picture
+    # of the aircraft from before the link dropped -- including the arming check that gates
+    # takeoff, which would otherwise see a stale armed=1 and spin the motors up.
+    TELEM_MAX_AGE_S = float(os.getenv("TELEM_MAX_AGE_S", "3.0"))
+
     def get_telemetry(self):
+        """Latest telemetry, or {} when there is none or it has gone stale.
+
+        Deliberately does NOT default battery to 100: an absent reading used to present as a
+        full pack, so every consumer downstream believed the aircraft was healthy. Callers
+        supply their own default and can tell "unknown" from "full".
         """
-        Returns telemetry (heading, battery).
-        """
-        if hasattr(self, 'latest_telem') and self.latest_telem:
-            return self.latest_telem
-        return {"heading": 0.0, "battery": 100}
+        if getattr(self, 'latest_telem', None):
+            if time.time() - getattr(self, '_telem_t', 0.0) <= self.TELEM_MAX_AGE_S:
+                return self.latest_telem
+            if not getattr(self, '_telem_stale_warned', False):
+                self._telem_stale_warned = True
+                print("⚠️ Telemetry stale - reporting unknown rather than last-known state")
+            return {}
+        return {}
 
     def get_position(self):
         """
