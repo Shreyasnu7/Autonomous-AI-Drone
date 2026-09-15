@@ -745,6 +745,30 @@ class RadxaBridge:
                                                b'AUTO_OPTIONS', 3, mavutil.mavlink.MAV_PARAM_TYPE_INT32)
                     print("⚙️ FC params enforced: PRX1_TYPE=2, AUTO_OPTIONS=3")
 
+                    # --- GEOFENCE: the only bound on a CONFIDENTLY WRONG command ------------
+                    # Every other safety layer is obstacle-relative (clearance table, caution
+                    # radius, reactive avoidance). In open air they all report "clear", so a
+                    # wrong heading is flown at full commanded speed with nothing to stop it.
+                    # ArduPilot enforces this fence itself, so it still holds if the companion
+                    # or the laptop AI misbehaves entirely. Needs a position estimate to act.
+                    _fence_r = float(os.environ.get('FENCE_RADIUS_M', '50'))
+                    _fence_a = float(os.environ.get('FENCE_ALT_MAX_M', '30'))
+                    _fence_on = os.environ.get('FENCE_ENABLE', '1') not in ('0', '', 'false', 'False')
+                    if _fence_on:
+                        for _pn, _pv, _pt in (
+                            (b'FENCE_TYPE',   3,        mavutil.mavlink.MAV_PARAM_TYPE_INT8),   # alt + circle
+                            (b'FENCE_RADIUS', _fence_r, mavutil.mavlink.MAV_PARAM_TYPE_REAL32),
+                            (b'FENCE_ALT_MAX',_fence_a, mavutil.mavlink.MAV_PARAM_TYPE_REAL32),
+                            (b'FENCE_ACTION', 1,        mavutil.mavlink.MAV_PARAM_TYPE_INT8),   # 1 = RTL
+                            (b'FENCE_ENABLE', 1,        mavutil.mavlink.MAV_PARAM_TYPE_INT8),
+                        ):
+                            self.fc.mav.param_set_send(self.fc.target_system,
+                                                       self.fc.target_component, _pn, _pv, _pt)
+                        print(f"🚧 GEOFENCE enforced: radius={_fence_r}m alt_max={_fence_a}m "
+                              f"action=RTL (set FENCE_ENABLE=0 to disable)")
+                    else:
+                        print("⚠️ GEOFENCE DISABLED by FENCE_ENABLE=0 - nothing bounds a wrong heading")
+
                     # Read back the rest of the avoidance chain and report it. These are NOT
                     # written automatically -- they are reported so a wrong value is visible
                     # rather than silently disabling avoidance in flight.

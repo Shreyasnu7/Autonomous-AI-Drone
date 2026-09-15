@@ -1377,6 +1377,8 @@ class DirectorCore:
                             # Jerk-limit ONLY (the AI's vx/vy/vz/yaw choice is untouched as a target) so
                             # the airframe ramps smoothly — no burst, no abrupt change. Hover=0 vel keeps
                             # motors spinning (never zero-RPM in air).
+                            # Bound a confidently-wrong heading (works with no GPS/obstacles).
+                            svx, svy, svz = self._runaway_check(svx, svy, svz)
                             svx, svy, svz, byaw = self._smooth_cmd(svx, svy, svz, byaw)
                             # AI WORKS ARDUPILOT'S MODES: a sustained hold -> LOITER (the FC holds position
                             # & rejects wind via GPS), low battery -> RTL; else GUIDED velocity setpoints
@@ -2441,6 +2443,82 @@ class DirectorCore:
         'left': (0.0, -1.0), 'front_left': (0.7071, -0.7071),
     }
 
+    def _runaway_check(self, vx, vy, vz):
+        """Bound a CONFIDENTLY WRONG command.
+
+        Every other guard here is obstacle-relative -- the clearance table, the caution radius,
+        reactive avoidance. In open air they all report "clear", so a wrong heading is flown at
+        full commanded speed with nothing to stop it until the battery does. ArduPilot's geofence
+        covers this outdoors, but needs a position estimate, so it cannot help indoors.
+
+        This is dead-reckoned from what WE commanded, so it works with no GPS and no obstacles:
+          * integrate commanded velocity into a displacement from where autonomy took over
+          * if that leash is exceeded, or the aircraft has been driven in essentially ONE
+            heading for longer than a sustained-travel limit, stop commanding motion and hold.
+
+        Returns the (possibly zeroed) velocity. Tripping is latched and must be cleared by a new
+        director intent, so the pilot cannot immediately resume the same run.
+        """
+        now = time.time()
+        # Both knobs are deliberately env-tunable: a long outdoor transit legitimately flies one
+        # heading for a while, so raise AI_STRAIGHT_MAX_S for that work; indoors, lower both.
+        # Tripping HOLDS POSITION -- it does not land or return -- and a new intent re-authorises.
+        LEASH_M = float(os.getenv("AI_LEASH_M", "60"))            # max dead-reckoned displacement
+        STRAIGHT_S = float(os.getenv("AI_STRAIGHT_MAX_S", "25"))  # max time on a single heading
+        MOVING = 0.15                                            # m/s considered "travelling"
+
+        prev_t = getattr(self, "_ra_t", None)
+        self._ra_t = now
+        if prev_t is None:
+            self._ra_pos = [0.0, 0.0, 0.0]
+            self._ra_head_t = now
+            self._ra_head = None
+            return vx, vy, vz
+        dt = max(0.0, min(1.0, now - prev_t))
+
+        if getattr(self, "_ra_tripped", False):
+            return 0.0, 0.0, 0.0
+
+        p = getattr(self, "_ra_pos", [0.0, 0.0, 0.0])
+        p[0] += vx * dt; p[1] += vy * dt; p[2] += vz * dt
+        self._ra_pos = p
+        dist = math.hypot(p[0], p[1])
+
+        speed = math.hypot(vx, vy)
+        if speed < MOVING:
+            self._ra_head = None
+            self._ra_head_t = now
+        else:
+            head = math.atan2(vy, vx)
+            prev_head = getattr(self, "_ra_head", None)
+            if prev_head is None or abs(math.atan2(math.sin(head - prev_head),
+                                                   math.cos(head - prev_head))) > math.radians(35):
+                self._ra_head = head           # meaningfully new direction -> restart the clock
+                self._ra_head_t = now
+            straight_for = now - getattr(self, "_ra_head_t", now)
+            if straight_for > STRAIGHT_S:
+                self._ra_tripped = True
+                print(f"🛑 RUNAWAY GUARD: {straight_for:.0f}s on one heading at "
+                      f"{speed:.2f} m/s with nothing obstructing -- holding position. "
+                      f"Issue a new intent to resume.")
+                return 0.0, 0.0, 0.0
+
+        if dist > LEASH_M:
+            self._ra_tripped = True
+            print(f"🛑 RUNAWAY GUARD: {dist:.0f} m from where autonomy began "
+                  f"(leash {LEASH_M:.0f} m) -- holding position. Issue a new intent to resume.")
+            return 0.0, 0.0, 0.0
+        return vx, vy, vz
+
+    def _runaway_reset(self, why=""):
+        """Clear the runaway latch and re-origin the leash (new intent = new authorised run)."""
+        self._ra_pos = [0.0, 0.0, 0.0]
+        self._ra_head = None
+        self._ra_head_t = time.time()
+        if getattr(self, "_ra_tripped", False):
+            print(f"✓ Runaway guard reset{(' (' + why + ')') if why else ''}")
+        self._ra_tripped = False
+
     def _caution_radius_m(self, speed):
         """Velocity-adaptive caution radius: standoff + reaction distance + braking distance,
         so faster flight keeps proportionally more clearance.
@@ -3048,6 +3126,7 @@ class DirectorCore:
             self._mission_active = True
             self._mission_text = mission_text
             self.er_brain.set_director_intent(mission_text)
+            self._runaway_reset('new director intent')
             if hasattr(self, 'gemini_brain') and self.gemini_brain:
                 try: self.gemini_brain.set_mission(mission_text)
                 except Exception: pass
