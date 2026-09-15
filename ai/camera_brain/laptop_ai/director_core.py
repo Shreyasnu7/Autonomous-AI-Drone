@@ -1183,10 +1183,16 @@ class DirectorCore:
 
                     if use_metric:
                         band = metric_map[_r_top:_r_bot, :]
-                        col_m = band.min(axis=0)                            # closest surface per column (metres)
+                        # Low PERCENTILE, not the raw minimum. Monocular depth speckles, and a
+                        # single bad pixel in a column previously became that column's reported
+                        # clearance -- and since clearance maps to a speed cap, one artifact at
+                        # 40 cm stops the aircraft dead for an obstacle that is not there. The
+                        # estimator's own metric API already uses the 10th percentile for this
+                        # reason; the grid path did not.
+                        col_m = np.percentile(band, 10, axis=0).astype(np.float32)
                     else:
                         band = depth_map[_r_top:_r_bot, :]   # same horizon-tracked window
-                        col_rel = band.min(axis=0)
+                        col_rel = np.percentile(band, 90, axis=0)   # relative: higher = closer
                         col_m = np.array([rel2m(v) for v in col_rel], dtype=np.float32)
                     # Same parallax correction on the clearances that drive avoidance, so the
                     # grid, the subject distance and the object labels all share one scale.
