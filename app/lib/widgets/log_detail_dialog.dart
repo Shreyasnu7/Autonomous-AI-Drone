@@ -19,6 +19,8 @@ class _LogDetailDialogState extends State<LogDetailDialog> with SingleTickerProv
   List<Offset> _flightPath = [];
   List<LatLng> _realPath = [];
   List<double> _altProfile = [];
+  List<double> _spdProfile = [];
+  List<double> _batProfile = [];
 
   GoogleMapController? _mapController;
   bool _isLoading = true;
@@ -44,6 +46,8 @@ class _LogDetailDialogState extends State<LogDetailDialog> with SingleTickerProv
       final lines = await file.readAsLines();
       List<LatLng> points = [];
       List<double> alts = [];
+      List<double> spds = [];
+      List<double> bats = [];
 
       for (var line in lines) {
         if (line.trim().isEmpty) continue;
@@ -56,6 +60,8 @@ class _LogDetailDialogState extends State<LogDetailDialog> with SingleTickerProv
            
            points.add(LatLng(lat, lng));
            alts.add(alt);
+           spds.add((data['spd'] as num?)?.toDouble() ?? 0.0);
+           bats.add((data['bat'] as num?)?.toDouble() ?? 0.0);
         } catch (_) {}
       }
 
@@ -63,6 +69,8 @@ class _LogDetailDialogState extends State<LogDetailDialog> with SingleTickerProv
         setState(() {
           _realPath = points;
           _altProfile = alts;
+          _spdProfile = spds;
+          _batProfile = bats;
           
           // Generate simple offsets for fallback painter (normalize to 0..1)
           // Simplified for now
@@ -254,7 +262,16 @@ class _LogDetailDialogState extends State<LogDetailDialog> with SingleTickerProv
                                      margin: const EdgeInsets.symmetric(vertical: 5),
                                      padding: const EdgeInsets.all(10),
                                      decoration: BoxDecoration(border: Border.all(color: Colors.white10), color: Colors.black54),
-                                     child: CustomPaint(painter: _LogGraphPainter(data: _altProfile.reversed.toList(), color: Colors.greenAccent)), 
+                                     child: CustomPaint(painter: _LogGraphPainter(data: _spdProfile, color: Colors.greenAccent)),
+                                   )),
+                                   const SizedBox(height: 5),
+                                   const Text("BATTERY PROFILE", style: TextStyle(color: Colors.white54, fontSize: 10)),
+                                   Expanded(child: Container(
+                                     width: double.infinity,
+                                     margin: const EdgeInsets.symmetric(vertical: 5),
+                                     padding: const EdgeInsets.all(10),
+                                     decoration: BoxDecoration(border: Border.all(color: Colors.white10), color: Colors.black54),
+                                     child: CustomPaint(painter: _LogGraphPainter(data: _batProfile, color: Colors.amberAccent)),
                                    )),
                                 ],
                               ),

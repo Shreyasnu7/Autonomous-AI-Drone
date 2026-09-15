@@ -8,6 +8,7 @@ import '../theme/app_theme.dart';
 import '../widgets/settings_sidebar.dart';
 import '../widgets/log_detail_dialog.dart';
 import '../services/flight_recorder.dart';
+import '../services/flight_recorder_service.dart';
 
 class HangarScreen extends StatefulWidget {
   const HangarScreen({super.key});
@@ -46,7 +47,9 @@ class _HangarScreenState extends State<HangarScreen> with SingleTickerProviderSt
   Future<void> _loadRealData() async {
     // 1. Fetch Logs
     try {
-      final logs = await ApiService.get('/logs'); // Uses mock or real
+      // Flight logs are recorded ON THIS DEVICE. Reading them from the relay meant the
+      // hangar listed cloud rows while the real recordings sat unread on disk.
+      final logs = await LocalFlightLogger().getPastFlights();
       
       // 2. Fetch Weather (use drone GPS if available, else user's phone GPS)
       double wLat = _centralState.droneLat != 0 ? _centralState.droneLat : 37.77;
@@ -55,12 +58,12 @@ class _HangarScreenState extends State<HangarScreen> with SingleTickerProviderSt
       
       // 3. Calculate Local Fleet Stats
       // Use the service we just fixed!
-      final localStats = await FlightRecorderService().getFleetStats();
+      final localStats = await LocalFlightLogger().getFleetStats();
 
       if (!mounted) return;
       
       setState(() {
-        _pastFlights = (logs as List).cast<Map<String, dynamic>>();
+        _pastFlights = logs;
 
         // Merge real stats
         _stats = localStats;
@@ -239,10 +242,11 @@ class _HangarScreenState extends State<HangarScreen> with SingleTickerProviderSt
                                           itemBuilder: (context, index) {
                                              final log = _pastFlights[index];
                                              return LogTile(
-                                                date: log["date"], 
-                                                loc: "Saved Flight", // Could reverse geocode if needed
-                                                dur: log["size"],    // Showing size for now as duration proxy
-                                                status: "SUCCESS"
+                                                date: log["date"],
+                                                loc: "Saved Flight",
+                                                dur: log["size"],
+                                                status: "SUCCESS",
+                                                filePath: (log["path"] ?? "") as String,
                                              );
                                           }
                                       ),
@@ -461,12 +465,14 @@ class ReadinessRow extends StatelessWidget {
 
 class LogTile extends StatelessWidget {
   final String date, loc, dur, status;
-  const LogTile({super.key, required this.date, required this.loc, required this.dur, required this.status});
+  final String filePath;
+  const LogTile({super.key, required this.date, required this.loc, required this.dur,
+                 required this.status, this.filePath = ""});
   @override
   Widget build(BuildContext context) {
     return GestureDetector(
       onTap: () {
-        showDialog(context: context, builder: (_) => LogDetailDialog(date: date, loc: loc, dur: dur, status: status, filePath: "path_placeholder"));
+        showDialog(context: context, builder: (_) => LogDetailDialog(date: date, loc: loc, dur: dur, status: status, filePath: filePath));
       },
       child: Container(
         margin: const EdgeInsets.only(bottom: 8),

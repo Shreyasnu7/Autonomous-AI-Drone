@@ -37,7 +37,11 @@ class CentralState extends ChangeNotifier {
       "tailscale_ip": "100.64.0.30" // Radxa Tailscale IP (works across any network)
   };
 
-  // Helper to update config and dispatch to Drone
+  // Helper to update config and dispatch to Drone.
+  // These used to go out over ApiService (HTTPS to the public relay), so nothing the
+  // operator changed here ever reached the aircraft on the local link -- including the
+  // return destination and battery threshold that drive the auto-return failsafe.
+  // They now travel the same WebSocket as every other command.
   void updateConfig(String key, dynamic value) {
      config[key] = value;
 
@@ -52,25 +56,25 @@ class CentralState extends ChangeNotifier {
      if (key == 'rth_alt') {
         // value is in meters, drone expects cm possibly? 
         // My set_rth_alt check in python expected 'alt' in cm
-        ApiService.sendCommand("set_rth_alt", {"alt": (value * 100).toInt()});
+        telemetry.sendCommand("set_rth_alt", {"alt": (value * 100).toInt()});
      }
 
      if (key == 'batt_threshold') {
-        ApiService.sendCommand("set_batt_threshold", {"threshold": value});
+        telemetry.sendCommand("set_batt_threshold", {"threshold": value});
      }
 
      if (key == 'rth_behavior') {
         // Send to DirectorCore
-        ApiService.sendCommand("SET_CONFIG:rth_behavior=$value", {});
+        telemetry.sendCommand("SET_CONFIG:rth_behavior=$value");
      }
 
      if (key == 'land_behavior') {
-        ApiService.sendCommand("SET_CONFIG:land_behavior=$value", {});
+        telemetry.sendCommand("SET_CONFIG:land_behavior=$value");
      }
 
      // NEW: Real Safety Toggle Propagation
      if (key == 'obstacle_avoidance' || key == 'vision_pos') {
-        ApiService.sendCommand("set_safety_config", {
+        telemetry.sendCommand("set_safety_config", {
            "obstacle_avoidance": config['obstacle_avoidance'],
            "vision_pos": config['vision_pos']
         });
@@ -78,17 +82,17 @@ class CentralState extends ChangeNotifier {
      
      if (key == 'cap_res') {
         // DirectorCore expects SET_CONFIG:res=value
-        ApiService.sendCommand("SET_CONFIG:res=$value", {});
+        telemetry.sendCommand("SET_CONFIG:res=$value");
      }
 
      if (key == 'stream_res') {
          // DirectorCore expects SET_CONFIG:stream_res=value
-         ApiService.sendCommand("SET_CONFIG:stream_res=$value", {});
+         telemetry.sendCommand("SET_CONFIG:stream_res=$value");
      }
      
      if (key == 'cam_source') {
          // DirectorCore expects SET_CONFIG:source=internal/external
-         ApiService.sendCommand("SET_CONFIG:source=$value", {});
+         telemetry.sendCommand("SET_CONFIG:source=$value");
      }
   }
 
