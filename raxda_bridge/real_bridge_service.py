@@ -351,6 +351,16 @@ class RadxaBridge:
             # (VISION_POSITION_ESTIMATE + EK3_SRC=ExternalNav) is configured, the FC HAS an indoor
             # position and gps_fix stays <3 only until the EKF accepts it — this path remains the
             # no-position fallback.
+            # Do not act on a flight controller that has gone silent: mode, armed state and
+            # gps_fix would all be read from frozen values.
+            _fc_age = time.time() - getattr(self, '_fc_msg_t', 0.0)
+            if getattr(self, '_fc_msg_t', 0.0) and _fc_age > float(os.environ.get('FC_STALE_S', '3.0')):
+                if not getattr(self, '_fc_link_lost', False):
+                    self._fc_link_lost = True
+                    print(f"⚠️ FC SILENT for {_fc_age:.1f}s - ignoring AI commands "
+                          f"(telemetry is frozen; the FC's own failsafes still apply)")
+                return
+
             _has_vel_kick = any(k in p for k in ('vx', 'vy', 'vz', 'yaw_rate'))
             _gps_fix = int(self.telemetry_cache.get('gps_fix', 0) or 0)
             if _has_vel_kick and _gps_fix < 3:
@@ -891,6 +901,14 @@ class RadxaBridge:
                   for _ in range(50):
                     msg = self.fc.recv_match(blocking=False)
                     if not msg: break
+                    # Liveness stamp. Nothing previously noticed the flight controller going
+                    # quiet (unplugged lead, brownout, UART fault): self.fc stayed set and the
+                    # telemetry cache kept serving its LAST values forever, so the battery
+                    # failsafe could never fire and armed/altitude/gps_fix stayed frozen.
+                    self._fc_msg_t = time.time()
+                    if getattr(self, '_fc_link_lost', False):
+                        self._fc_link_lost = False
+                        print("✓ FC link restored")
 
                     type = msg.get_type()
                     # Battery Failsafe
@@ -2956,6 +2974,10 @@ class RadxaBridge:
                      try:
                          self.fc.mav.set_mode_send(self.fc.target_system, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 6)  # RTL
                      except: pass
+
+            _fa = time.time() - getattr(self, '_fc_msg_t', 0.0)
+            self.telemetry_cache['fc_link'] = ('LOST' if (getattr(self, '_fc_msg_t', 0.0)
+                                                          and _fa > 3.0) else 'OK')
 
             # V110: BATTERY FAILSAFE — use configurable threshold (not hardcoded 15%)
             current_batt = self.telemetry_cache.get('battery', 100)
