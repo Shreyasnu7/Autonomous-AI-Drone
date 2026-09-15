@@ -1117,7 +1117,7 @@ class _ControlScreenState extends State<ControlScreen> with TickerProviderStateM
                      onClose: () => setState(() => _showAnalyticsSidebar = false),
                      altHistory: state.altHistory,
                      speedHistory: state.speedHistory,
-                     batHistory: [], // Add if tracked
+                     batHistory: state.batHistory,
                      currentAlt: altitudeVN.value,
                      currentSpeed: speedVN.value,
                      currentDist: distanceVN.value,

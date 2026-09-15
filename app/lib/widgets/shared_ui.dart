@@ -115,7 +115,9 @@ class True3DPainter extends CustomPainter {
   final double angle;
   final Color color;
   final double tiltX;
-  True3DPainter({required this.angle, required this.color, this.tiltX = 0.4});
+  final double roll;   // bank angle, radians. Was absent entirely, so the attitude
+                       // display could not show the aircraft banking at all.
+  True3DPainter({required this.angle, required this.color, this.tiltX = 0.4, this.roll = 0.0});
   @override
   void paint(Canvas canvas, Size size) {
     final cx = size.width / 2;
@@ -128,10 +130,16 @@ class True3DPainter extends CustomPainter {
     final tilt = tiltX;
     final cosT = cos(tilt);
     final sinT = sin(tilt);
+    final cosR = cos(roll);
+    final sinR = sin(roll);
     List<Offset> projected = [];
     List<double> zDepth = [];
     for (var p in points) {
       double x = p[0]; double y = p[1]; double z = p[2];
+      // roll first: rotate the airframe about its own forward (z) axis
+      double xr = x * cosR - y * sinR;
+      double yr = x * sinR + y * cosR;
+      x = xr; y = yr;
       double x1 = x * cosA - z * sinA;
       double z1 = x * sinA + z * cosA;
       double y2 = y * cosT - z1 * sinT;

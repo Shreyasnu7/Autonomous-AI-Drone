@@ -69,7 +69,7 @@ class AnalyticsSidebar extends StatelessWidget {
                       // Real Attitude Binding
                       // Note: True3DPainter takes angle (yaw) and tiltX (pitch). 
                       // For full roll support, we'd update the painter, but this removes the 'static' 0.5 value.
-                      painter: True3DPainter(angle: currentYaw, tiltX: currentPitch, color: Colors.blue),
+                      painter: True3DPainter(angle: currentYaw, tiltX: currentPitch, roll: currentRoll, color: Colors.blue),
                    ),
                 ),
                 
