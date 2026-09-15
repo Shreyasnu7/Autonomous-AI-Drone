@@ -1165,7 +1165,35 @@ class RadxaBridge:
             if self.follow_me_active and _ugps and self.fc:
                 if not hasattr(self, '_last_follow_send') or now - self._last_follow_send > 2.0:
                     self._last_follow_send = now
-                    lat, lng = self._user_gps_fresh() or (None, None)
+                    lat, lng = _ugps
+
+                    # SANITY BOUND. This commands a GUIDED waypoint straight from a phone's GPS.
+                    # A bad fix -- urban canyon, indoors, an A-GPS glitch -- can jump kilometres,
+                    # and the aircraft would simply fly there. Require our own fix (a global
+                    # waypoint is meaningless without one) and refuse implausible targets.
+                    _fix = int(self.telemetry_cache.get('gps_fix', 0) or 0)
+                    _dlat = self.telemetry_cache.get('lat')
+                    _dlng = self.telemetry_cache.get('lng')
+                    _max_m = float(os.environ.get('FOLLOW_MAX_DIST_M', '150'))
+                    if _fix < 3 or _dlat in (None, 0) or _dlng in (None, 0):
+                        if not getattr(self, '_follow_nofix_warned', False):
+                            self._follow_nofix_warned = True
+                            print("⚠️ FOLLOW-ME: no GPS fix on the aircraft - not commanding "
+                                  "a global waypoint")
+                        continue
+                    self._follow_nofix_warned = False
+                    _d = 6371000.0 * math.acos(max(-1.0, min(1.0,
+                            math.sin(math.radians(_dlat)) * math.sin(math.radians(lat)) +
+                            math.cos(math.radians(_dlat)) * math.cos(math.radians(lat)) *
+                            math.cos(math.radians(lng - _dlng)))))
+                    if _d > _max_m:
+                        if not getattr(self, '_follow_jump_warned', False):
+                            self._follow_jump_warned = True
+                            print(f"⚠️ FOLLOW-ME: operator fix is {_d:.0f} m away "
+                                  f"(limit {_max_m:.0f} m) - ignoring, looks like a GPS jump")
+                        continue
+                    self._follow_jump_warned = False
+
                     alt = self.telemetry_cache.get('altitude', 5)
                     alt = max(3, alt)  # Don't descend below 3m while following
                     # Ensure GUIDED mode
