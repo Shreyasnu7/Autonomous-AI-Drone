@@ -95,3 +95,5 @@ key.properties
 project_root/
 # Generated run output
 audit_output.txt
+app/.flutter-plugins
+app/.flutter-plugins-dependencies
