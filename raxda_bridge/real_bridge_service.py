@@ -102,11 +102,28 @@ class SafetyEnvelope:
             'back':  self.telem.get('t3', -1),
             'left':  self.telem.get('t4', -1),
         }
+        # Drop the whole set once it has gone stale. Without this the gate kept approving or
+        # refusing movement using clearances measured before the ESP32 link dropped -- readings
+        # that describe where the aircraft USED to be.
+        _age = time.time() - float(self.telem.get('_tof_t', 0) or 0)
+        if self.telem.get('_tof_t') and _age > float(os.environ.get('TOF_STALE_S', '1.5')):
+            sensors = {}
+
         # Filter out invalid readings (-1 means no sensor or no reading)
         valid = {k: v / 1000.0 for k, v in sensors.items()
                  if v > 0 and v < 8000}  # ToF max ~8m, values in mm
         if not valid:
+            # No usable proximity data. This returns "clear" so the aircraft stays flyable
+            # without ToF, but the operator should know the gate is running blind rather than
+            # confirming open space.
+            if not getattr(self, '_blind_warned', False):
+                self._blind_warned = True
+                print("⚠️ SAFETY GATE BLIND: no valid ToF readings "
+                      "(absent or stale) - proximity checks are not protecting you")
             return 9.9, 'none'
+        if getattr(self, '_blind_warned', False):
+            self._blind_warned = False
+            print("✓ SAFETY GATE: ToF readings live again")
         min_dir = min(valid, key=valid.get)
         return valid[min_dir], min_dir
 
@@ -3084,6 +3101,9 @@ class RadxaBridge:
 
                              # Inject raw ToF into telem cache for SafetyEnvelope
                              self.telemetry_cache['t1'] = data.get('t1', -1)
+                             # Arrival stamp: the safety gate must not keep trusting these
+                             # clearances after the ESP32 link drops.
+                             self.telemetry_cache['_tof_t'] = time.time()
                              self.telemetry_cache['t2'] = data.get('t2', -1)
                              self.telemetry_cache['t3'] = data.get('t3', -1)
                              self.telemetry_cache['t4'] = data.get('t4', -1)
