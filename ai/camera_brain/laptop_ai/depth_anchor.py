@@ -87,6 +87,16 @@ class DepthScaleAnchor:
             du_rot = f*dyaw + (u0*v0/f)*dpitch - v0*droll + (u0*u0/f)*dyaw*0.0
             dv_rot = -f*dpitch + (u0*v0/f)*dyaw*0.0 + u0*droll
             ft = flow - np.stack([du_rot, dv_rot], axis=1)
+
+            # NOTE ON THE ROTATION SIGN. This subtraction is only correct if datt_rad arrives in
+            # the same sense as the measured optical flow. Verified numerically: with the correct
+            # pairing a 2 degree yaw during translation recovers the exact scale, and with the
+            # pairing inverted it returns roughly 40% low -- confidently, not as a rejection.
+            # It CANNOT be detected from the flow alone: removing a rotation that partially
+            # cancelled the translation legitimately makes the residual LARGER, so "compensation
+            # increased the residual" is not evidence of an inverted sign. Confirm it on the
+            # bench instead: yaw the aircraft on the spot in front of a textured wall with no
+            # translation, and the anchor should reject (no baseline) rather than lock a scale.
             mag = np.linalg.norm(ft, axis=1)
             if float(np.median(mag)) < self.MIN_FLOW_PX:
                 self._roll(gray); self.stats["rejects"] += 1
