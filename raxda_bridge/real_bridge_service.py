@@ -338,7 +338,9 @@ class RadxaBridge:
         if isinstance(p, dict):
             _vmax = float(os.environ.get('MAX_AI_SPEED_MS', '2.0'))
             _yawmax = float(os.environ.get('MAX_AI_YAW_DPS', '90.0'))
-            for _k, _lim in (('vx', _vmax), ('vy', _vmax), ('vz', _vmax), ('yaw_rate', _yawmax)):
+            for _k, _lim in (('vx', _vmax), ('vy', _vmax), ('vz', _vmax), ('yaw_rate', _yawmax),
+                             ('yaw', 360.0), ('gimbal_pitch', 90.0), ('gimbal_yaw', 90.0),
+                             ('pitch', 90.0), ('pan', 90.0)):
                 if _k in p:
                     try:
                         _v = float(p[_k])
