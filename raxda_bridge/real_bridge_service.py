@@ -1509,7 +1509,18 @@ class RadxaBridge:
             # the EKF origin can lag the GPS fix by several seconds, so the GUIDED switch itself
             # gets DENIED ("requires position"). Absorb the race here: keep re-requesting GUIDED
             # until the FC actually reports it (EKF ready), THEN command the climb.
-            alt = float(p.get('alt', 5))
+            # Bound the climb. This took the altitude straight from the packet, so a malformed
+            # plan could command a takeoff to thousands of metres, or a negative one. The
+            # ceiling matches the geofence so the two cannot disagree.
+            try:
+                alt = float(p.get('alt', 5))
+            except (TypeError, ValueError):
+                alt = 5.0
+            _alt_max = float(os.environ.get('FENCE_ALT_MAX_M', '30'))
+            if not (alt == alt) or alt < 0.5 or alt > _alt_max:    # NaN or out of range
+                print(f"⚠️ TAKEOFF alt {p.get('alt')!r} out of range - using "
+                      f"{min(max(5.0, 0.5), _alt_max):.1f}m (limit {_alt_max:.0f}m)")
+                alt = min(max(5.0, 0.5), _alt_max)
             for _ in range(24):                                   # up to ~12s of EKF settling
                 self.fc.mav.set_mode_send(self.fc.target_system,
                                           mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 4)
