@@ -10,6 +10,7 @@ Validation harnesses for the Autonomous AI Drone. See [../docs/VERIFICATION.md](
 |---|---|---|---|
 | `sitl_bridge_test.py` | Firmware-in-the-loop | 13 | ArduCopter SITL binary |
 | `sitl_mission_test.py` | Firmware-in-the-loop | 10 | ArduCopter SITL binary |
+| `test_depth_projection.py` | Camera depth geometry | 8 | nothing (pure numpy) |
 
 Both bind **production bridge methods** to real ArduPilot firmware. They are not mocks of the bridge — a failure here is a failure that would occur in flight.
 
@@ -31,8 +32,9 @@ curl -sL -o copter.parm \
 ## Running
 
 ```bash
-python3 tests/sitl_bridge_test.py     # 13 checks: arm, modes, takeoff, velocity, RTL, land, no-GPS
-python3 tests/sitl_mission_test.py    # 10 checks: map-route mission upload and execution
+python3 tests/sitl_bridge_test.py       # 13 checks: arm, modes, takeoff, velocity, RTL, land, no-GPS
+python3 tests/sitl_mission_test.py      # 10 checks: map-route mission upload and execution
+python3 tests/test_depth_projection.py  #  8 checks: camera depth geometry (no hardware needed)
 ```
 
 Expected output ends with:
