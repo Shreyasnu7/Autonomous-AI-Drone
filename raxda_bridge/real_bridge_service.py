@@ -989,8 +989,8 @@ class RadxaBridge:
                             if _fix < 3:
                                 print(f"LOW BATT: no GPS (fix={_fix}) — LANDING IN PLACE (safe, no blind RTL)")
                                 self.fc.mav.set_mode_send(self.fc.target_system, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 9)
-                            elif self.batt_rth_destination == 'user' and self.user_gps:
-                                lat, lng = self.user_gps
+                            elif self.batt_rth_destination == 'user' and self._user_gps_fresh():
+                                lat, lng = _ugps
                                 print(f"RTH to User: {lat}, {lng}")
                                 self.fc.mav.set_mode_send(self.fc.target_system, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 4)
                                 self.fc.mav.mission_item_int_send(self.fc.target_system, self.fc.target_component, 0, mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT, mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, 2, 0, 0, 0, 0, 0, int(lat * 1e7), int(lng * 1e7), 15)
@@ -1161,10 +1161,11 @@ class RadxaBridge:
             self.telemetry_cache['safety'] = self.safety.get_safety_status()
 
             # FOLLOW ME: Continuously send user GPS as GUIDED waypoint (every 2s)
-            if self.follow_me_active and self.user_gps and self.fc:
+            _ugps = self._user_gps_fresh()
+            if self.follow_me_active and _ugps and self.fc:
                 if not hasattr(self, '_last_follow_send') or now - self._last_follow_send > 2.0:
                     self._last_follow_send = now
-                    lat, lng = self.user_gps
+                    lat, lng = self._user_gps_fresh() or (None, None)
                     alt = self.telemetry_cache.get('altitude', 5)
                     alt = max(3, alt)  # Don't descend below 3m while following
                     # Ensure GUIDED mode
@@ -1263,6 +1264,29 @@ class RadxaBridge:
             self.fc.mav.set_mode_send(self.fc.target_system,
                                       mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 9)
             print("LAND(user): goto window elapsed -> LAND mode for descent")
+
+    def _user_gps_fresh(self):
+        """The operator's position, or None once it is too old to fly to.
+
+        This drives return-to-user and FOLLOW_ME. It was never aged, so if the phone stopped
+        reporting -- app backgrounded, screen off, signal lost -- the aircraft would keep
+        flying to where the operator USED to be, indefinitely, and a low-battery return would
+        head there instead of home. Stale now falls back to the launch point, which is at
+        least a known location.
+        """
+        if not self.user_gps:
+            return None
+        age = time.time() - getattr(self, '_user_gps_t', 0.0)
+        if age > float(os.environ.get('USER_GPS_MAX_AGE_S', '12')):
+            if not getattr(self, '_user_gps_stale_warned', False):
+                self._user_gps_stale_warned = True
+                print(f"⚠️ Operator GPS stale ({age:.0f}s) - return-to-user and follow-me "
+                      f"fall back to the launch point")
+            return None
+        if getattr(self, '_user_gps_stale_warned', False):
+            self._user_gps_stale_warned = False
+            print("✓ Operator GPS live again")
+        return self.user_gps
 
     async def _execute_settings_command(self, cmd, payload=None):
         """Apply an operator settings command. Single implementation shared by the local
@@ -1500,8 +1524,8 @@ class RadxaBridge:
                 self.fc.mav.set_mode_send(self.fc.target_system,
                                           mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 9)
                 asyncio.create_task(self._land_backstop_disarm())
-            elif self.batt_rth_destination == 'user' and self.user_gps:
-                lat, lng = self.user_gps
+            elif self.batt_rth_destination == 'user' and self._user_gps_fresh():
+                lat, lng = self._user_gps_fresh() or (None, None)
                 print(f"🏠 RTH TO USER (local): ({lat:.6f}, {lng:.6f})")
                 self.fc.mav.set_mode_send(self.fc.target_system,
                                           mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 4)
@@ -1522,8 +1546,8 @@ class RadxaBridge:
             # (and a blind RTL) can't navigate -> LAND in place instead.
             _fix = int(self.telemetry_cache.get('gps_fix', 0) or 0)
             lat = p.get('lat'); lng = p.get('lng')
-            if lat is None and self.user_gps:
-                lat, lng = self.user_gps
+            if lat is None and self._user_gps_fresh():
+                lat, lng = self._user_gps_fresh() or (None, None)
             if _fix < 3:
                 print(f"🏠 RETURN TO USER: no GPS (fix={_fix}) — LANDING IN PLACE (safe)")
                 self._cmd_lock_until = time.time() + 16.0
@@ -1625,6 +1649,7 @@ class RadxaBridge:
         if type == 'user_gps':
             if payload and isinstance(payload, dict) and 'lat' in payload:
                 self.user_gps = (payload.get('lat'), payload.get('lng'))
+                self._user_gps_t = time.time()
             return
 
         # joystick from app via Tailscale
@@ -1779,6 +1804,7 @@ class RadxaBridge:
                 if type == 'user_gps':
                     if payload and 'lat' in payload:
                         self.user_gps = (payload.get('lat'), payload.get('lng'))
+                self._user_gps_t = time.time()
                 # V55: OMNI-PARSER
                 cmd = type
 
@@ -1984,8 +2010,8 @@ class RadxaBridge:
                 elif cmd in ('RTL', 'RTH'):
                     # V110: RTH from app = RTL to ArduPilot
                     # If user_gps available and rth_behavior is 'user', fly to user instead
-                    if self.batt_rth_destination == 'user' and self.user_gps:
-                        lat, lng = self.user_gps
+                    if self.batt_rth_destination == 'user' and self._user_gps_fresh():
+                        lat, lng = self._user_gps_fresh() or (None, None)
                         print(f"🏠 RTH TO USER: ({lat:.6f}, {lng:.6f})")
                         self.fc.mav.set_mode_send(self.fc.target_system, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 4)
                         self.fc.mav.mission_item_int_send(
@@ -2010,8 +2036,8 @@ class RadxaBridge:
 
                 # RETURN TO USER — fly to user's live GPS position
                 elif cmd in ('RETURN_TO_USER', 'RTH_USER', 'RETURN_USER'):
-                    if self.user_gps:
-                        lat, lng = self.user_gps
+                    if self._user_gps_fresh():
+                        lat, lng = self._user_gps_fresh() or (None, None)
                         alt = float(payload.get('alt', 15)) if isinstance(payload, dict) else 15
                         print(f"RTH TO USER: ({lat}, {lng}) @ {alt}m")
                         self.fc.mav.set_mode_send(
@@ -2982,8 +3008,8 @@ class RadxaBridge:
             if last_msg_delta > 30.0 and not self.watchdog_triggered and self.is_armed and airborne:
                  self.watchdog_triggered = True
                  # Priority: Return to user GPS if available, else RTL to launch
-                 if self.user_gps:
-                     lat, lng = self.user_gps
+                 if self._user_gps_fresh():
+                     lat, lng = self._user_gps_fresh() or (None, None)
                      print(f"⚠️ LOST CONNECTION ({int(last_msg_delta)}s)! RETURNING TO USER @ ({lat:.6f}, {lng:.6f})")
                      try:
                          self.fc.mav.set_mode_send(self.fc.target_system, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 4)  # GUIDED
@@ -3028,8 +3054,8 @@ class RadxaBridge:
                       self.low_batt_triggered = True
                       self.follow_me_active = False  # Stop follow on low batt
                       # Use configured RTH destination
-                      if self.batt_rth_destination == 'user' and self.user_gps:
-                          lat, lng = self.user_gps
+                      if self.batt_rth_destination == 'user' and self._user_gps_fresh():
+                          lat, lng = self._user_gps_fresh() or (None, None)
                           print(f"⚠️ LOW BATTERY ({current_batt}% < {self.batt_threshold}%)! RETURNING TO USER @ ({lat:.6f}, {lng:.6f})")
                           try:
                               self.fc.mav.set_mode_send(self.fc.target_system, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 4)
