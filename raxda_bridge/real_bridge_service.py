@@ -2997,8 +2997,25 @@ class RadxaBridge:
                                                           and _fa > 3.0) else 'OK')
 
             # V110: BATTERY FAILSAFE — use configurable threshold (not hardcoded 15%)
-            current_batt = self.telemetry_cache.get('battery', 100)
-            if self.is_armed and current_batt < self.batt_threshold and current_batt > 0:
+            # Battery is read straight from telemetry. It used to default to 100 when the field
+            # was absent, so a flight controller that never reported a battery percentage left
+            # this failsafe permanently inert -- silently, and looking exactly like a full pack.
+            # Unknown is now reported rather than assumed healthy.
+            current_batt = self.telemetry_cache.get('battery', None)
+            _batt_known = isinstance(current_batt, (int, float)) and current_batt > 0
+            _fc_live = not getattr(self, '_fc_link_lost', False)
+            if not (_batt_known and _fc_live):
+                if self.is_armed and not getattr(self, '_batt_blind_warned', False):
+                    self._batt_blind_warned = True
+                    print(f"⚠️ BATTERY FAILSAFE INERT: no usable battery reading "
+                          f"(value={current_batt!r}, fc_link={'OK' if _fc_live else 'LOST'}) "
+                          f"- low-battery return will NOT trigger. Watch the pack yourself.")
+                current_batt = None
+            elif getattr(self, '_batt_blind_warned', False):
+                self._batt_blind_warned = False
+                print("✓ Battery reading restored - failsafe active again")
+
+            if self.is_armed and current_batt is not None and current_batt < self.batt_threshold:
                  if not getattr(self, 'low_batt_triggered', False):
                       self.low_batt_triggered = True
                       self.follow_me_active = False  # Stop follow on low batt
