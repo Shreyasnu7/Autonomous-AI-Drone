@@ -1159,11 +1159,33 @@ class DirectorCore:
                     # geometry (cam pitch/fwd) — field-calibrate that on the real drone.
                     hfov = math.radians(MOUNT['cam_hfov_deg'])
                     _tan_half_h = math.tan(hfov / 2.0)
+                    # HORIZON BAND, TRACKED TO THE GIMBAL.
+                    # The band was fixed at 30-62% of frame height, which is the horizon only
+                    # while the camera is level. The code skips frames tilted past 35 degrees,
+                    # but at, say, 20 degrees of pitch this window was already sampling floor and
+                    # reporting it as the closest surface in every column. Convert the desired
+                    # elevation range into rows using the vertical FOV and the live gimbal pitch,
+                    # so the band follows the real horizon instead of assuming one.
+                    _vfov = 2.0 * math.atan(math.tan(hfov / 2.0) * (h_d / float(w_d)))
+                    _tan_half_v = math.tan(_vfov / 2.0)
+                    _gpitch = math.radians(float(getattr(self, '_gimbal_pitch_deg', 0.0)))
+
+                    def _row_for_elev(elev_rad):
+                        # elevation in BODY frame -> row index (0 = top). Camera pitch shifts it.
+                        _e = elev_rad - _gpitch
+                        _t = math.tan(max(-1.2, min(1.2, _e)))
+                        return int(round((0.5 - (_t / (2.0 * _tan_half_v))) * h_d))
+
+                    _r_top = _row_for_elev(math.radians(12.0))    # a little above the horizon
+                    _r_bot = _row_for_elev(math.radians(-8.0))    # a little below it
+                    _r_top = max(0, min(h_d - 2, min(_r_top, _r_bot)))
+                    _r_bot = max(_r_top + 1, min(h_d, max(_r_top + 1, _r_bot)))
+
                     if use_metric:
-                        band = metric_map[int(h_d * 0.30):int(h_d * 0.62), :]
+                        band = metric_map[_r_top:_r_bot, :]
                         col_m = band.min(axis=0)                            # closest surface per column (metres)
                     else:
-                        band = depth_map[int(h_d * 0.40):int(h_d * 0.75), :]  # mid/lower rows = ground & near obstacles
+                        band = depth_map[_r_top:_r_bot, :]   # same horizon-tracked window
                         col_rel = band.min(axis=0)
                         col_m = np.array([rel2m(v) for v in col_rel], dtype=np.float32)
                     # Same parallax correction on the clearances that drive avoidance, so the
