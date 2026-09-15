@@ -531,9 +531,21 @@ class RadxaBridge:
                 )
 
             elif has_local_pos:
-                x = float(p.get('x', 0))
-                y = float(p.get('y', 0))
-                z = float(p.get('z', -5))  # NED: negative = up
+                # Bound the local offset. These were unchecked, so a malformed plan could command
+                # a position kilometres away in the local frame, or a NaN into the setpoint.
+                def _off(v, default, lim):
+                    try:
+                        v = float(v)
+                    except (TypeError, ValueError):
+                        return default
+                    if v != v:
+                        return default
+                    return max(-lim, min(lim, v))
+                _lim = float(os.environ.get('LOCAL_POS_MAX_M', '100'))
+                _zlim = float(os.environ.get('FENCE_ALT_MAX_M', '30'))
+                x = _off(p.get('x', 0), 0.0, _lim)
+                y = _off(p.get('y', 0), 0.0, _lim)
+                z = _off(p.get('z', -5), -5.0, _zlim)   # NED: negative = up
 
                 type_mask = (
                     0b0000_0001_11_111_000  # use position, ignore velocity & accel
@@ -1791,10 +1803,19 @@ class RadxaBridge:
         if type == 'gimbal':
             if isinstance(payload, dict):
                 try:
+                    # Clamp gimbal angles. These are forwarded to the ESP32 and written to
+                    # servos; an out-of-range or non-numeric value drives them against their
+                    # mechanical stops.
+                    def _ang(v):
+                        try:
+                            v = float(v)
+                        except (TypeError, ValueError):
+                            return 0.0
+                        return 0.0 if v != v else max(-90.0, min(90.0, v))
                     self.esp32_cmd_queue.put_nowait({
                         "type": "gimbal",
-                        "pitch": payload.get('pitch', 0),
-                        "yaw": payload.get('yaw', 0)
+                        "pitch": _ang(payload.get('pitch', 0)),
+                        "yaw": _ang(payload.get('yaw', 0))
                     })
                 except: pass
             return
