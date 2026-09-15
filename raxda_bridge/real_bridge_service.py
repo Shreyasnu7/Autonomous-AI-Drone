@@ -312,6 +312,30 @@ class RadxaBridge:
         action_name = payload.get('action', 'AI') if isinstance(payload, dict) else 'AI'
         print(f"AI PLAN: {action_name} | {p}")
 
+        # ABSOLUTE VELOCITY SANITY BOUND — the last line of defence.
+        # The laptop pilot clamps its own stream to the clearance table, but a DISCRETE plan
+        # (e.g. a malformed Gemini response) arrives here directly and bypasses those clamps.
+        # The RC conversion below only clips the resulting PWM to [1100,1900], so an absurd
+        # value such as vx=99 did not get rejected -- it became FULL STICK, i.e. maximum tilt.
+        # Clamp the intent itself, and say so, rather than silently flying it.
+        if isinstance(p, dict):
+            _vmax = float(os.environ.get('MAX_AI_SPEED_MS', '2.0'))
+            _yawmax = float(os.environ.get('MAX_AI_YAW_DPS', '90.0'))
+            for _k, _lim in (('vx', _vmax), ('vy', _vmax), ('vz', _vmax), ('yaw_rate', _yawmax)):
+                if _k in p:
+                    try:
+                        _v = float(p[_k])
+                    except (TypeError, ValueError):
+                        print(f"⚠️ AI PLAN: {_k}={p[_k]!r} is not a number -> dropped")
+                        p[_k] = 0.0
+                        continue
+                    if _v != _v or _v in (float('inf'), float('-inf')):      # NaN / inf
+                        print(f"⚠️ AI PLAN: {_k}={_v} not finite -> dropped")
+                        p[_k] = 0.0
+                    elif abs(_v) > _lim:
+                        print(f"⚠️ AI PLAN: {_k}={_v} exceeds {_lim} -> clamped")
+                        p[_k] = math.copysign(_lim, _v)
+
         try:
             # --- VELOCITY COMMAND (vx, vy, vz present) ---
             has_velocity = any(k in p for k in ('vx', 'vy', 'vz'))

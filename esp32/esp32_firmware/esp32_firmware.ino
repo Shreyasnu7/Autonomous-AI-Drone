@@ -61,6 +61,10 @@ uint16_t radxa_port = 8888;
 #define PIN_ONBOARD 2
 
 // TOF SENSORS
+// PHYSICAL MOUNTING — the flight software depends on this mapping and cannot verify it:
+//   t1 = FRONT, t2 = RIGHT, t3 = BACK, t4 = LEFT
+// (bridge telemetry keys t1..t4; spatial_grid maps t1->(0,-1) front, t2->(+1,0) right,
+//  t3->(0,+1) back, t4->(-1,0) left). If a sensor is moved, update BOTH ends.
 #define PIN_XSHUT1 23
 #define PIN_XSHUT2 26
 #define PIN_XSHUT3 15
@@ -90,6 +94,12 @@ float g_gx, g_gy, g_gz;
 int CurrentPitch = 90;
 int CurrentYaw = 90;
 int dist1=-1, dist2=-1, dist3=-1, dist4=-1;
+// Freshness stamps. Without these a sensor that stops responding keeps its LAST distance
+// forever and it is still transmitted at 10Hz as though current -- the flight side then
+// trusts clearance it cannot actually see. Anything older than TOF_STALE_MS reverts to -1,
+// which every consumer already treats as "no reading".
+unsigned long tof_t1=0, tof_t2=0, tof_t3=0, tof_t4=0;
+#define TOF_STALE_MS 500
 
 // --- LIVE I2C SCANNER (diagnostic: shows what's actually on the bus) ---
 String i2c_found = "scanning";
@@ -622,10 +632,17 @@ void loop() {
          }
     }
 
-    if(t1 && tof1.dataReady()) { dist1 = tof1.read(false); }
-    if(t2 && tof2.dataReady()) { dist2 = tof2.read(false); }
-    if(t3 && tof3.dataReady()) { dist3 = tof3.read(false); }
-    if(t4 && tof4.dataReady()) { dist4 = tof4.read(false); }
+    unsigned long _tnow = millis();
+    if(t1 && tof1.dataReady()) { dist1 = tof1.read(false); tof_t1 = _tnow; }
+    if(t2 && tof2.dataReady()) { dist2 = tof2.read(false); tof_t2 = _tnow; }
+    if(t3 && tof3.dataReady()) { dist3 = tof3.read(false); tof_t3 = _tnow; }
+    if(t4 && tof4.dataReady()) { dist4 = tof4.read(false); tof_t4 = _tnow; }
+
+    // Expire readings that have gone stale (sensor died, bus wedged, mux lost).
+    if (dist1 >= 0 && _tnow - tof_t1 > TOF_STALE_MS) dist1 = -1;
+    if (dist2 >= 0 && _tnow - tof_t2 > TOF_STALE_MS) dist2 = -1;
+    if (dist3 >= 0 && _tnow - tof_t3 > TOF_STALE_MS) dist3 = -1;
+    if (dist4 >= 0 && _tnow - tof_t4 > TOF_STALE_MS) dist4 = -1;
 
     // TELEMETRY (UDP + Serial Debug)
     if (millis() - last_telem > 100) { // 10Hz Update

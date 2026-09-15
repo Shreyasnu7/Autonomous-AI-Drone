@@ -2442,13 +2442,41 @@ class DirectorCore:
     }
 
     def _caution_radius_m(self, speed):
-        """Velocity-adaptive caution radius (F450). Never below 2x arm (0.45 m); grows with
-        speed by reaction distance + braking distance so faster flight keeps more standoff."""
+        """Velocity-adaptive caution radius: standoff + reaction distance + braking distance,
+        so faster flight keeps proportionally more clearance.
+
+            r = 2*arm + v*t_reaction + v^2 / (2*a_brake)
+
+        a_brake was a hardcoded 2.5 m/s^2 while the jerk limiter beside it already derived the
+        airframe's real acceleration from its tilt limit. It is now derived the same way, but
+        only ever in the SAFE direction: a weaker airframe (braking below 2.5) widens the radius,
+        while a stronger one is NOT allowed to shrink it below the conservative baseline. The
+        reaction term likewise takes the measured control-loop period when that exceeds the
+        assumed 0.30 s, so a slow inference tick enlarges the radius instead of silently eating
+        into the margin.
+        """
         ARM = 0.225
         MIN_STANDOFF = 2 * ARM          # 0.45 m
-        REACTION = 0.30                 # s of pilot/loop latency
-        DECEL = 2.5                     # m/s^2 achievable braking
-        r = MIN_STANDOFF + speed * REACTION + (speed * speed) / (2 * DECEL)
+        BASELINE_DECEL = 2.5            # m/s^2 — conservative floor, never exceeded
+
+        a_brake = BASELINE_DECEL
+        try:
+            tilt = float(getattr(DroneConfig, 'MAX_TILT_ANGLE', 25) or 25)
+            tilt = min(tilt, 25.0)                       # indoor-conservative, matches _smooth_cmd
+            derived = 9.81 * math.tan(math.radians(tilt))
+            a_brake = min(BASELINE_DECEL, derived)       # only ever MORE cautious
+        except Exception:
+            pass
+
+        reaction = 0.30
+        try:
+            measured = float(getattr(self, '_ctrl_dt', 0.0) or 0.0)
+            if 0.0 < measured < 2.0:
+                reaction = max(reaction, measured)
+        except Exception:
+            pass
+
+        r = MIN_STANDOFF + speed * reaction + (speed * speed) / (2 * max(0.5, a_brake))
         return max(MIN_STANDOFF, min(r, 2.5))
 
     # ════════════════════════════════════════════════════════════════════════════════════════
@@ -2769,6 +2797,7 @@ class DirectorCore:
         now = time.time()
         dt = max(0.02, min(0.5, now - getattr(self, '_cmd_prev_t', now)))
         self._cmd_prev_t = now
+        self._ctrl_dt = dt        # measured control period -> feeds the caution radius' reaction term
         pv = getattr(self, '_cmd_prev', (0.0, 0.0, 0.0, 0.0))
         # Ramp limits DERIVED FROM THIS DRONE (not a flat constant): the max horizontal accel a heavier/
         # lower-thrust airframe can sustain = g·tan(tilt); we cap tilt conservatively for smooth indoor
