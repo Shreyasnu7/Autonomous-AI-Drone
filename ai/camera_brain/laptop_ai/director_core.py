@@ -1197,12 +1197,27 @@ class DirectorCore:
                         self.autopilot.send_velocity(0, 0, 0)
                         print("🛑 Pi0 EMERGENCY BRAKE")
                     else:
-                        # Store corrections — ER brain will add these to its velocity
-                        scale = 0.05  # Small corrections (stability, not override)
+                        # Store corrections — ER brain will add these to its velocity.
+                        # These are STABILITY trims, not a second pilot. pitch/roll are degrees
+                        # clamped at +-30, so the old 0.05 scale allowed +-1.5 m/s -- larger than
+                        # the 0.6 m/s cruise cap it is added to, meaning that in open air (where
+                        # the clearance clamp permits the full 0.6) the trim could dominate the
+                        # direction the AI actually chose. Bound it to a genuine micro-correction.
+                        scale = 0.05
+                        _PI0_MAX = float(os.getenv("PI0_TRIM_MAX_MS", "0.20"))   # m/s, horizontal
+                        _PI0_MAX_VZ = float(os.getenv("PI0_TRIM_MAX_VZ_MS", "0.20"))
+                        def _trim(v, lim):
+                            try:
+                                v = float(v)
+                            except (TypeError, ValueError):
+                                return 0.0
+                            if v != v:            # NaN
+                                return 0.0
+                            return max(-lim, min(lim, v))
                         self._pi0_correction = {
-                            'vx': pi0_commands.get('pitch', 0) * scale,
-                            'vy': pi0_commands.get('roll', 0) * scale,
-                            'vz': (pi0_commands.get('throttle', 0.5) - 0.5) * 0.5,
+                            'vx': _trim(pi0_commands.get('pitch', 0) * scale, _PI0_MAX),
+                            'vy': _trim(pi0_commands.get('roll', 0) * scale, _PI0_MAX),
+                            'vz': _trim((pi0_commands.get('throttle', 0.5) - 0.5) * 0.5, _PI0_MAX_VZ),
                         }
 
             # 4a. LOCAL ER BRAIN (QWEN2.5-VL) — Continuous fast spatial decisions

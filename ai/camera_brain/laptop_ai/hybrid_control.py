@@ -46,15 +46,36 @@ _SECTOR_UNIT = {  # body unit (fwd, right) per 8-sector bearing
 _SECTOR_BEARING = {"F": 0, "FR": 45, "R": 90, "BR": 135, "B": 180, "BL": 225, "L": 270, "FL": 315}
 
 
+# The pilot path (local_er_brain._speed_cap_cm / director_core._clearance_speed_cap) caps speed
+# with a conservative LOOKUP TABLE. This module derived it from physics instead, which is sound
+# but markedly more permissive -- at 80 cm clearance the table allows 0.20 m/s while the formula
+# allowed 0.57 m/s. Same obstacle, same drone, three times the speed depending only on which code
+# path was driving. The table is the binding limit everywhere now; the formula may only be
+# stricter, never looser.
+def _table_cap_ms(cm):
+    """The conservative clearance table shared with the pilot path. Keep in sync with
+    local_er_brain._speed_cap_cm and director_core._clearance_speed_cap."""
+    if cm < 60:
+        return 0.0
+    if cm < 100:
+        return 0.20
+    if cm < 150:
+        return 0.35
+    if cm < 250:
+        return 0.50
+    return 0.60
+
+
 def speed_for_clearance(cm, max_speed):
     """Max safe speed (m/s) toward a direction with `cm` clearance — the stopping-distance guarantee.
-    Derived from v <= sqrt(2*DECEL*(clear - standoff)); tabulated + capped to the airframe limit."""
+    Physics bound v <= sqrt(2*DECEL*(clear - standoff)) minus reaction creep, then held to the
+    shared conservative table and the airframe limit."""
     m = cm / 100.0
     usable = m - MIN_STANDOFF
     if usable <= 0:
         return 0.0
     v = math.sqrt(2 * DECEL_MS2 * usable) - REACTION_S * DECEL_MS2  # subtract reaction creep
-    return max(0.0, min(v, max_speed))
+    return max(0.0, min(v, max_speed, _table_cap_ms(cm)))
 
 
 def _ease(prev, target, max_step):
