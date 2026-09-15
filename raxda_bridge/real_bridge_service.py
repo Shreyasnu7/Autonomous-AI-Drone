@@ -384,7 +384,15 @@ class RadxaBridge:
                 vx = float(p.get('vx', 0)); vy = float(p.get('vy', 0))
                 vz = float(p.get('vz', 0)); yr = float(p.get('yaw_rate', 0))
                 if self.obstacle_avoidance:
-                    _tof = {k: self.telemetry_cache.get(k, -1) for k in ('t1', 't2', 't3', 't4')}
+                    # Honour the same freshness rule as the safety gate. Feeding the avoidance
+                    # controller clearances measured before the ESP32 link dropped would have it
+                    # steer around obstacles that are no longer where it thinks they are; -1 is
+                    # the module's own "invalid" marker and is handled conservatively.
+                    _tof_age = time.time() - float(self.telemetry_cache.get('_tof_t', 0) or 0)
+                    _tof_ok = (self.telemetry_cache.get('_tof_t')
+                               and _tof_age <= float(os.environ.get('TOF_STALE_S', '1.5')))
+                    _tof = ({k: self.telemetry_cache.get(k, -1) for k in ('t1', 't2', 't3', 't4')}
+                            if _tof_ok else {k: -1 for k in ('t1', 't2', 't3', 't4')})
                     vx, vy, vz = self.obstacle_avoidance.adjust_velocity_command(
                         vx, vy, vz, _tof, drone_yaw_rad=self.telemetry_cache.get('yaw', 0))
                 if str(self.telemetry_cache.get('mode_id', '')) not in ('ALT_HOLD', '2'):
