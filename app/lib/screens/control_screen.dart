@@ -49,6 +49,7 @@ class _ControlScreenState extends State<ControlScreen> with TickerProviderStateM
   bool _showSettingsSidebar = false;  
   bool _showAnalyticsSidebar = false;
   bool _isRecording = false;
+  bool _manualControl = false;
   
   // Joysticks
   Offset leftStick = Offset.zero;
@@ -883,6 +884,47 @@ class _ControlScreenState extends State<ControlScreen> with TickerProviderStateM
                                     context.read<CentralState>().telemetry.sendCommand("ARM");
                                     context.read<CentralState>().telemetry.sendControl(0, 0, -1.0, 0);
                                   }
+                               )),
+                               // KILL SWITCH. Deliberately its own control, not a mode of DISARM:
+                               // when it is needed there is no time to find the right menu, and
+                               // it must never be confused with a normal landing.
+                               const SizedBox(height: 15),
+                               SizedBox(width: 40, height: 40, child: CamButton(
+                                  icon: Icons.dangerous,
+                                  color: Colors.red,
+                                  onTap: () {
+                                    _addLog("KILL SWITCH");
+                                    context.read<CentralState>().telemetry.sendCommand("KILL");
+                                  },
+                               )),
+                               // TAKE / GIVE control. Touching the sticks already seizes control;
+                               // this is for taking it BEFORE the aircraft misbehaves, and for
+                               // handing it back, which is always deliberate.
+                               const SizedBox(height: 15),
+                               SizedBox(width: 40, height: 40, child: CamButton(
+                                  icon: _manualControl ? Icons.smart_toy : Icons.pan_tool,
+                                  color: _manualControl ? Colors.tealAccent : Colors.amberAccent,
+                                  onTap: () {
+                                    setState(() => _manualControl = !_manualControl);
+                                    final t = context.read<CentralState>().telemetry;
+                                    if (_manualControl) {
+                                      _addLog("MANUAL CONTROL");
+                                      t.sendCommand("TAKE_CONTROL");
+                                    } else {
+                                      _addLog("AI CONTROL");
+                                      t.sendCommand("GIVE_CONTROL");
+                                    }
+                                  },
+                               )),
+                               // HOVER: stop and hold, as hard as the airframe can.
+                               const SizedBox(height: 15),
+                               SizedBox(width: 40, height: 40, child: CamButton(
+                                  icon: Icons.pause_circle_filled,
+                                  color: Colors.lightBlueAccent,
+                                  onTap: () {
+                                    _addLog("HOVER / HOLD");
+                                    context.read<CentralState>().telemetry.sendCommand("HOVER");
+                                  },
                                )),
                                // DISARM BUTTON (below ARM, same size) — confirm popup -> force-disarm
                                const SizedBox(height: 15),

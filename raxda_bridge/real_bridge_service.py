@@ -223,6 +223,9 @@ class RadxaBridge:
         self.latest_external_frame = None   # Latest GoPro frame
         self.batt_threshold = 20
         self.user_gps = None # (lat, lng)
+        self._control_mode = 'ai'      # 'ai' | 'manual'  (see _set_authority)
+        self._authority_since = 0.0
+        self._tx_ref = None            # resting transmitter stick positions
         self.last_cloud_msg = time.time()
         self.low_batt_triggered = False
         self.is_armed = False # V107: Init missing state
@@ -379,6 +382,16 @@ class RadxaBridge:
                     print(f"⚠️ FC SILENT for {_fc_age:.1f}s - ignoring AI commands "
                           f"(telemetry is frozen; the FC's own failsafes still apply)")
                 return
+
+            # A human holds authority: the AI does not get to fly, and says so once rather than
+            # silently dropping commands the operator may still believe are being executed.
+            if self._authority() == 'manual':
+                if not getattr(self, '_ai_blocked_logged', False):
+                    self._ai_blocked_logged = True
+                    print("⛔ AI command ignored - MANUAL control is held "
+                          "(switch back from the app to return authority)")
+                return
+            self._ai_blocked_logged = False
 
             _has_vel_kick = any(k in p for k in ('vx', 'vy', 'vz', 'yaw_rate'))
             _gps_fix = int(self.telemetry_cache.get('gps_fix', 0) or 0)
@@ -933,6 +946,11 @@ class RadxaBridge:
         # burned bandwidth on the flight link. Opt in explicitly if the relay is wanted.
         if os.environ.get("ENABLE_CLOUD_RELAY", "0") in ("0", "", "false", "False"):
             print("[LINK] Cloud relay DISABLED (set ENABLE_CLOUD_RELAY=1 to enable). Local link only.")
+            # Sleep rather than return: the subsystem supervisor treats a clean return as an
+            # unexpected exit and restarts it, which turned a disabled relay into a two-second
+            # restart loop filling the log.
+            while self.running:
+                await asyncio.sleep(3600)
             return
         while self.running:
             try:
@@ -1171,7 +1189,9 @@ class RadxaBridge:
                          if msg.heading != 65535:
                              self.telemetry_cache['heading'] = msg.heading
 
-                    elif type == 'RC_CHANNELS_RAW': # V27: Debug Switch Positions
+                    elif type in ('RC_CHANNELS_RAW', 'RC_CHANNELS'):
+                         self._note_tx_activity(msg)
+                    if type == 'RC_CHANNELS_RAW': # V27: Debug Switch Positions
                          # Log channels 5, 6, 7 (common for mode switches) every 2s
                          if int(time.time()) % 2 == 0 and int(time.time()) != getattr(self, 'last_rc_log', 0):
                               self.last_rc_log = int(time.time())
@@ -1361,6 +1381,105 @@ class RadxaBridge:
             self._user_gps_stale_warned = False
             print("✓ Operator GPS live again")
         return self.user_gps
+
+    # ==================================================================================
+    # CONTROL AUTHORITY - who is flying, and how control is taken back
+    # ==================================================================================
+    # There was no arbitration at all: AI velocity commands, application sticks and the pilot's
+    # transmitter all wrote to the same channels whenever they arrived, and the last writer won.
+    # Taking control away from a misbehaving AI meant out-shouting it.
+    #
+    # Authority is now explicit and there are three ways to seize it, in order of directness:
+    #   1. the transmitter - move a stick and the bridge stops overriding, full stop
+    #   2. the application sticks - any stick packet takes manual authority
+    #   3. an explicit switch from the application
+    # Returning to AI is ALWAYS deliberate. Nothing hands authority back automatically, because a
+    # system that grabs the aircraft back on its own is exactly what the operator just overrode.
+
+    TX_NEUTRAL_US = 1500
+    TX_MOVE_US = 120          # how far a transmitter stick must move to count as intent
+    HANDOFF_RAMP_S = 0.35     # user input is ramped in over this, so takeover is not a step
+
+    def _authority(self):
+        return getattr(self, '_control_mode', 'ai')
+
+    def _set_authority(self, mode, reason=""):
+        prev = getattr(self, '_control_mode', 'ai')
+        if prev == mode:
+            return
+        self._control_mode = mode
+        self._authority_since = time.time()
+        if mode == 'manual':
+            # Stop the AI's motion immediately rather than blending out of it. Whatever it was
+            # doing is the reason authority was taken.
+            self._cmd_lock_until = max(getattr(self, '_cmd_lock_until', 0.0), time.time() + 0.25)
+            print(f"🕹️ MANUAL CONTROL ({reason}) - AI commands ignored until you hand it back")
+        elif mode == 'ai':
+            print(f"🤖 AI CONTROL restored ({reason})")
+        self.telemetry_cache['control_mode'] = mode
+
+    def _note_tx_activity(self, msg):
+        """Watch the pilot's own transmitter. Moving a stick is an unambiguous request for
+        control, so it takes priority over everything else and needs no app, no link and no
+        button -- if the laptop or the application is the problem, this still works."""
+        try:
+            chans = [getattr(msg, f'chan{i}_raw', 0) for i in (1, 2, 3, 4)]
+        except Exception:
+            return
+        live = [c for c in chans if 900 < c < 2100]
+        if len(live) < 4:
+            return                                  # no transmitter bound, nothing to honour
+        if getattr(self, '_tx_ref', None) is None:
+            self._tx_ref = live                     # first good frame becomes the resting reference
+            return
+        moved = max(abs(c - r) for c, r in zip(live, self._tx_ref))
+        if moved > self.TX_MOVE_US:
+            self._tx_ref = live
+            if self._authority() != 'manual':
+                self._set_authority('manual', 'transmitter stick moved')
+
+    def _handoff_gain(self):
+        """Ramp user input in over a moment after a takeover, so control does not arrive as a
+        step onto whatever the AI was already commanding. It ramps rather than blocks: someone
+        taking control from a misbehaving AI must not be made to wait for it."""
+        t = time.time() - getattr(self, '_authority_since', 0.0)
+        if t >= self.HANDOFF_RAMP_S:
+            return 1.0
+        return max(0.0, min(1.0, t / self.HANDOFF_RAMP_S))
+
+    async def _hover_now(self, reason=""):
+        """Stop and hold, as fast as this airframe can.
+
+        Neutral sticks are NOT a hover: in ALT_HOLD they stop commanding tilt, but the aircraft
+        keeps whatever momentum it had and then drifts with the air. The fastest genuine stop is
+        ArduPilot's BRAKE mode, which uses the position controller to arrest movement and hold --
+        but it needs a position estimate, so it is only offered when one exists. Without position
+        the honest best is neutral sticks in ALT_HOLD, and the operator is told that is what they
+        are getting, because the aircraft WILL drift and they need to expect it.
+        """
+        if not self.fc:
+            return
+        self._cmd_lock_until = time.time() + 1.0        # stop any stream fighting the hold
+        fix = int(self.telemetry_cache.get('gps_fix', 0) or 0)
+        has_pos = fix >= 3 or bool(self.telemetry_cache.get('slam_pose'))
+        try:
+            if has_pos:
+                # 17 = BRAKE: stops as hard as the airframe allows, then holds position.
+                self.fc.mav.set_mode_send(self.fc.target_system,
+                                          mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 17)
+                print(f"✋ HOVER ({reason}): BRAKE - hard stop and hold position")
+            else:
+                self.fc.mav.set_mode_send(self.fc.target_system,
+                                          mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 2)
+                self.fc.mav.rc_channels_override_send(
+                    self.fc.target_system, self.fc.target_component,
+                    1500, 1500, 1500, 1500, 0, 0, 0, 0)
+                print(f"✋ HOVER ({reason}): ALT_HOLD, sticks neutral. NO POSITION ESTIMATE - "
+                      f"altitude is held but the aircraft WILL drift with the air.")
+            self._hover_since = time.time()
+            self._hover_expected = True
+        except Exception as e:
+            print(f"⚠️ hover request failed: {e}")
 
     async def _execute_settings_command(self, cmd, payload=None):
         """Apply an operator settings command. Single implementation shared by the local
@@ -1586,6 +1705,33 @@ class RadxaBridge:
             self.fc.mav.command_long_send(self.fc.target_system, self.fc.target_component,
                                           mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
                                           0, 1, 0, 0, 0, 0, 0, 0)
+            return True
+
+        if cmd in ('TAKE_CONTROL', 'MANUAL'):
+            self._set_authority('manual', 'requested from the app')
+            await self._hover_now("manual takeover")
+            return True
+
+        if cmd in ('GIVE_CONTROL', 'RESUME_AI', 'AI_CONTROL'):
+            # Deliberate, and only from a human. Nothing hands authority back automatically.
+            self._set_authority('ai', 'handed back from the app')
+            return True
+
+        if cmd in ('HOVER', 'HOLD', 'STOP'):
+            await self._hover_now("requested")
+            return True
+
+        if cmd in ('KILL', 'EMERGENCY_STOP', 'MOTORS_OFF'):
+            # Kill is DISARM without ceremony: it takes authority first so nothing re-arms behind
+            # it, then force-disarms repeatedly. It is deliberately a separate word from DISARM so
+            # it can be bound to its own control and never confused with a normal landing.
+            self._set_authority('manual', 'kill switch')
+            self._cmd_lock_until = time.time() + 10.0
+            for _ in range(5):
+                self.fc.mav.command_long_send(self.fc.target_system, self.fc.target_component,
+                                              mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                                              0, 0, 21196, 0, 0, 0, 0, 0)
+            print("🛑 KILL SWITCH - motors cut, 10s lockout")
             return True
 
         if cmd == 'DISARM':
@@ -1833,6 +1979,16 @@ class RadxaBridge:
                 # but the stick path passed its value straight through, so pushing the stick
                 # forward commanded 1850 and flew the aircraft BACKWARD. Two paths driving one
                 # channel in opposite directions is the sloppy, unpredictable handling this had.
+                # Touching the sticks IS the request for control. Requiring a separate button
+                # first would mean the obvious reaction to a misbehaving aircraft does nothing.
+                if self._authority() != 'manual':
+                    if max(abs(raw_roll), abs(raw_pitch), abs(raw_yaw), abs(raw_thr)) > 0.05:
+                        self._set_authority('manual', 'app stick input')
+                _g = self._handoff_gain()
+                raw_roll *= _g
+                raw_pitch *= _g
+                raw_yaw *= _g
+
                 rc1 = map_ch(raw_roll)
                 rc2 = map_ch(raw_pitch, invert=True)
                 rc3 = map_ch(raw_thr)
@@ -3203,6 +3359,68 @@ class RadxaBridge:
                      try:
                          self.fc.mav.set_mode_send(self.fc.target_system, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 6)  # RTL
                      except: pass
+
+            # ---- IS IT ACTUALLY HOVERING? -------------------------------------------
+            # A hover can fail quietly. The aircraft reports zero velocity because the estimator
+            # it trusts says so, and that estimator is exactly what may be wrong -- a drifting
+            # EKF, a pinned SLAM pose, a GPS fix that has wandered. Asking it "are you holding
+            # position" then answers with the same broken number, so the answer is worthless.
+            #
+            # The check therefore uses a source that does not depend on the position estimate at
+            # all: the RANGE TO THINGS. If the aircraft is genuinely still, the distances the
+            # LiDAR and ToF report cannot all march in one direction. When they do while the
+            # aircraft believes it is hovering, it is moving and does not know it.
+            try:
+                if getattr(self, '_hover_expected', False) and self.is_armed:
+                    _hnow = time.time()
+                    _rng = self.telemetry_cache.get('lidar_dist')
+                    if _rng in (None, 0, -1):
+                        _t1v = self.telemetry_cache.get('t1', -1)
+                        _rng = (_t1v / 1000.0) if isinstance(_t1v, (int, float)) and _t1v > 0 else None
+                    _rep_speed = float(self.telemetry_cache.get('speed', 0) or 0)
+                    _prev = getattr(self, '_hover_rng', None)
+                    self._hover_rng = (_rng, _hnow)
+                    _drifting = False
+                    _why = ""
+                    if _rep_speed > 0.6:
+                        _drifting, _why = True, f"reported groundspeed {_rep_speed:.1f} m/s"
+                    elif _prev and _prev[0] and _rng:
+                        _dt = max(0.05, _hnow - _prev[1])
+                        _closing = abs(_rng - _prev[0]) / _dt          # metres per second
+                        if _closing > 0.5:
+                            _drifting = True
+                            _why = f"range to obstacles changing at {_closing:.1f} m/s"
+                    if _drifting:
+                        self._hover_bad = getattr(self, '_hover_bad', 0) + 1
+                    else:
+                        self._hover_bad = 0
+                    # Two consecutive confirmations, so one noisy reading cannot trigger it.
+                    if self._hover_bad == 2:
+                        print(f"⚠️ HOVER IS NOT HOLDING - {_why}. The position estimate "
+                              f"disagrees with the range sensors, so it cannot be trusted to hold.")
+                        _fix = int(self.telemetry_cache.get('gps_fix', 0) or 0)
+                        if _fix >= 3 or self.telemetry_cache.get('slam_pose'):
+                            # It claimed a position and still drifted: stop trusting that source
+                            # and fall back to the mode that needs nothing but a barometer.
+                            print("   position-holding mode failed -> falling back to ALT_HOLD, "
+                                  "neutral sticks. TAKE MANUAL CONTROL.")
+                            self.fc.mav.set_mode_send(
+                                self.fc.target_system,
+                                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 2)
+                            self.fc.mav.rc_channels_override_send(
+                                self.fc.target_system, self.fc.target_component,
+                                1500, 1500, 1500, 1500, 0, 0, 0, 0)
+                        else:
+                            print("   no position estimate exists, so this drift is expected - "
+                                  "the aircraft can hold ALTITUDE only. TAKE MANUAL CONTROL.")
+                        for c in list(self.local_clients):
+                            try:
+                                await c.send(json.dumps({"type": "alert", "payload": {
+                                    "msg": "HOVER NOT HOLDING - take manual control", "level": "error"}}))
+                            except Exception:
+                                pass
+            except Exception:
+                pass
 
             _fa = time.time() - getattr(self, '_fc_msg_t', 0.0)
             self.telemetry_cache['fc_link'] = ('LOST' if (getattr(self, '_fc_msg_t', 0.0)
