@@ -1413,7 +1413,19 @@ class DirectorCore:
                                 _cxp = min(max((float(bx[0]) + float(bx[2])) / 2 / _fw, 0.0), 1.0)
                                 _cyp = min(max((float(bx[1]) + float(bx[3])) / 2 / _fh, 0.0), 1.0)
                                 _hd, _wd = _dm.shape[:2]
-                                _o["distance_m"] = round(min(_r2m(_dm[int(_cyp * (_hd - 1)), int(_cxp * (_wd - 1))]) * _scale, 30.0), 2)
+                                # Use the METRIC map when one is loaded, exactly as the obstacle
+                                # grid does. This always went through the relative-to-metres
+                                # approximation, so the model was TOLD a distance derived one way
+                                # while the grid it flies by measured the same object another --
+                                # two different answers for one object.
+                                _mm_o = (self.threaded_depth.get_metric()
+                                         if getattr(self, 'threaded_depth', None) else None)
+                                _py = int(_cyp * (_hd - 1)); _px = int(_cxp * (_wd - 1))
+                                if _mm_o is not None and _mm_o.shape[:2] == _dm.shape[:2]:
+                                    _dist = float(_mm_o[_py, _px]) * _scale
+                                else:
+                                    _dist = _r2m(_dm[_py, _px]) * _scale
+                                _o["distance_m"] = round(min(_dist, 30.0), 2)
                                 _o["bearing"] = "front-left" if _cxp < 0.38 else ("front-right" if _cxp > 0.62 else "center")
                             if hasattr(d, 'xyxy'):
                                 _bb = d.xyxy[0]
