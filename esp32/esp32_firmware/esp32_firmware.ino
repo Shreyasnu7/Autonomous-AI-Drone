@@ -495,10 +495,14 @@ void checkCommand(Stream &s) {
                         else currentMode = M_IDLE;
                     }
                     if (doc.containsKey("gim")) {
-                        // servos removed — just track commanded angles for telemetry
-                        int p = doc["gim"][0]; int y = doc["gim"][1];
-                        CurrentPitch = map(p, -90, 90, 0, 180);
-                        CurrentYaw = map(y, -90, 90, 0, 180);
+                        // servos removed — just track commanded angles for telemetry.
+                        // Arduino map() does NOT constrain: gim=1000 produced 1090 here, and the
+                        // laptop uses these angles to project the camera depth cone into a grid
+                        // sector, so an out-of-range value places obstacles in the wrong place.
+                        int p = constrain((int)doc["gim"][0], -90, 90);
+                        int y = constrain((int)doc["gim"][1], -90, 90);
+                        CurrentPitch = constrain(map(p, -90, 90, 0, 180), 0, 180);
+                        CurrentYaw   = constrain(map(y, -90, 90, 0, 180), 0, 180);
                     }
                     if (doc.containsKey("stab")) stabilize_active = doc["stab"];
                     if (doc.containsKey("mode")) {
