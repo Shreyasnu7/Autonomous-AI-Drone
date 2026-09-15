@@ -1685,9 +1685,21 @@ class RadxaBridge:
             if not isinstance(payload, dict):
                 return
             try:
+                # Clamp to the valid RC band. This mapped an unbounded float straight into an
+                # RC override: x=5.0 produced 4000, and a negative overshoot produced a NEGATIVE
+                # int that packs into a uint16 near 65535 -- which MAVLink reads as "ignore this
+                # channel", so a malformed packet could silently drop an axis instead of
+                # centring it. Stick input is normalised to [-1, 1] first.
                 def map_ch(val, center=True):
-                    if center: return int(1500 + (val * 500))
-                    return int(1000 + (val * 1000))
+                    try:
+                        val = float(val)
+                    except (TypeError, ValueError):
+                        val = 0.0
+                    if val != val:                      # NaN
+                        val = 0.0
+                    val = max(-1.0, min(1.0, val))
+                    raw = (1500 + val * 500) if center else (1000 + val * 1000)
+                    return int(max(1000, min(2000, raw)))
 
                 raw_roll  = float(payload.get('x', 0))
                 raw_pitch = float(payload.get('y', 0))
