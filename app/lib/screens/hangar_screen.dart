@@ -310,10 +310,22 @@ class _HangarScreenState extends State<HangarScreen> with SingleTickerProviderSt
                                       const ReadinessRow(label: "Telemetry", value: "WAITING", icon: Icons.sensors_off, color: Colors.grey),
                                    ],
                                    
-                                   // We keep these for verified boot, but make them less "Fake" appearing
-                                   // For now, if connected, they are "OK"
+                                   // Was a hardcoded "Firmware V3.5 STABLE" -- a fixed string the
+                                   // aircraft never reported. Replaced with GPS state, which the
+                                   // bridge does send and which actually gates arming.
                                    if (_centralState.isDeviceConnected)
-                                     const ReadinessRow(label: "Firmware", value: "V3.5 STABLE", icon: Icons.system_update, color: Colors.green),
+                                     Builder(builder: (_) {
+                                       final t = _centralState.telemetryData;
+                                       final fix = (t["gps_fix"] is num) ? (t["gps_fix"] as num).toInt() : 0;
+                                       final sats = (t["sats"] is num) ? (t["sats"] as num).toInt() : 0;
+                                       final ok = fix >= 3;
+                                       return ReadinessRow(
+                                         label: "GPS",
+                                         value: ok ? "FIX ($sats sats)" : "NO FIX ($sats sats)",
+                                         icon: ok ? Icons.satellite_alt : Icons.location_disabled,
+                                         color: ok ? Colors.green : Colors.orangeAccent,
+                                       );
+                                     }),
               
                                    const SizedBox(height: 20),
                                    const Text("LOCAL CONDITIONS", style: TextStyle(color: Color(0xFF2DD4BF), fontSize: 12, fontWeight: FontWeight.bold, letterSpacing: 1)),

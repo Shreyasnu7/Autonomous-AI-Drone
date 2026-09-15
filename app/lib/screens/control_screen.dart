@@ -936,7 +936,24 @@ class _ControlScreenState extends State<ControlScreen> with TickerProviderStateM
                                 const SizedBox(width: 8),
                                 Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                                   Text(flightMode, style: TextStyle(color: neonTeal, fontWeight: FontWeight.bold, fontSize: 16)),
-                                  const Text("READY TO FLY", style: TextStyle(fontSize: 10, color: Colors.white54)),
+                                  // Was a hardcoded "READY TO FLY" that showed regardless of link,
+                                  // arming or GPS state -- i.e. it claimed readiness while the
+                                  // aircraft was unreachable. Derived from live telemetry instead.
+                                  Consumer<CentralState>(
+                                    builder: (context, st, _) {
+                                      final t = st.telemetryData;
+                                      final linked = st.isDeviceConnected;
+                                      final armed = t["armed"] == true || t["armed"] == 1;
+                                      final fix = (t["gps_fix"] is num) ? (t["gps_fix"] as num).toInt() : 0;
+                                      String label;
+                                      Color c;
+                                      if (!linked) { label = "NO LINK"; c = Colors.redAccent; }
+                                      else if (armed) { label = "ARMED"; c = Colors.orangeAccent; }
+                                      else if (fix >= 3) { label = "READY TO FLY"; c = Colors.white54; }
+                                      else { label = "DISARMED - NO GPS FIX"; c = Colors.amberAccent; }
+                                      return Text(label, style: TextStyle(fontSize: 10, color: c));
+                                    },
+                                  ),
                                 ])
                               ]),
                               // Telemetry Row
