@@ -749,7 +749,7 @@ class DirectorCore:
         print("🚀 Director Core Starting...")
         
         # 1. Start Vision Loop (Camera + UI)
-        asyncio.create_task(self._vision_loop())
+        asyncio.create_task(self._vision_loop_supervised())
         
         # 2. Start Autonomous Brain (Idle thoughts)
         asyncio.create_task(self._autonomous_reasoning_loop())
@@ -858,6 +858,40 @@ class DirectorCore:
                 # HIDDEN: asyncio.create_task(self.process_job(syn_job))
                 pass # Disabled Idle thoughts for now
                 last_act_time = time.time() # Reset timer
+
+    async def _vision_loop_supervised(self):
+        """Keep the pilot alive.
+
+        _vision_loop was started with create_task and has no top-level guard, so a single
+        unhandled exception anywhere in it -- a malformed frame, an unexpected None, a driver
+        hiccup -- ended the task. Python would note the unretrieved exception and carry on, and
+        the autonomous pilot would simply be gone: no commands, no error, no restart. The
+        aircraft itself holds when commands stop (RC override expires in about three seconds),
+        but the operator had no indication the brain had died.
+
+        Restarting is safe because all state lives on self; the loop re-enters from the top.
+        """
+        backoff = 2.0
+        while True:
+            try:
+                await self._vision_loop()
+                print("⚠️ Vision loop exited without error - restarting")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                traceback.print_exc()
+                print(f"🛑 VISION LOOP CRASHED - restarting in {backoff:.0f}s. "
+                      f"The aircraft holds while the pilot is down.")
+            # Stand the pilot down cleanly before re-entering, so a restart cannot resume a
+            # half-finished manoeuvre on stale state.
+            try:
+                self._runaway_reset('pilot restarted')
+                if getattr(self, 'er_brain', None):
+                    self.er_brain.note_blocked("pilot restarted - re-observe before moving")
+            except Exception:
+                pass
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 1.5, 15.0)
 
     async def _vision_loop(self):
         """
