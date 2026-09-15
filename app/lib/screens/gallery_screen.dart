@@ -1,4 +1,6 @@
 import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import '../services/central_state.dart';
 import '../theme/app_theme.dart';
 import '../services/media_service.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -26,7 +28,8 @@ class _GalleryScreenState extends State<GalleryScreen> with SingleTickerProvider
   }
 
   Future<void> _loadMedia() async {
-    final items = await MediaService.getGalleryItems();
+    final items = await MediaService.getGalleryItems(
+        state: Provider.of<CentralState>(context, listen: false));
     if(mounted) setState(() { _mediaItems = items; _loading = false; });
   }
 

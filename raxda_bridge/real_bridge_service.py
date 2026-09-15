@@ -517,12 +517,74 @@ class RadxaBridge:
                 print(f"⚠️ Port 8000 busy (attempt {attempt+1}/5): {e}")
                 await asyncio.sleep(3)
 
+    MEDIA_EXT = {'.mp4': 'video/mp4', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png'}
+
+    def _media_dir(self):
+        """Where video_loop writes flight_record_*.mp4 and photo_*.jpg (the process cwd)."""
+        return os.path.abspath(os.environ.get('MEDIA_DIR', os.getcwd()))
+
+    async def handle_media_list(self, request):
+        """List media recorded on the aircraft, newest first.
+
+        Returns the shape the application's gallery already expects:
+            [{id, type: 'photo'|'video', url, name, size, timestamp}]
+        """
+        from aiohttp import web
+        host = request.headers.get('Host') or f"{TAILSCALE_RADXA_IP}:8080"
+        base = f"http://{host}/media/"
+        items = []
+        d = self._media_dir()
+        try:
+            for name in os.listdir(d):
+                ext = os.path.splitext(name)[1].lower()
+                if ext not in self.MEDIA_EXT:
+                    continue
+                if not (name.startswith('flight_record_') or name.startswith('photo_')):
+                    continue
+                fp = os.path.join(d, name)
+                try:
+                    st = os.stat(fp)
+                except OSError:
+                    continue
+                items.append({
+                    "id": name,
+                    "name": name,
+                    "type": "video" if ext == '.mp4' else "photo",
+                    "url": base + name,
+                    "size": st.st_size,
+                    "timestamp": int(st.st_mtime),
+                })
+        except Exception as e:
+            print(f"⚠️ media list failed: {e}")
+        items.sort(key=lambda i: i["timestamp"], reverse=True)
+        return web.json_response(items)
+
+    async def handle_media_file(self, request):
+        """Serve one recorded file. The name is validated against the listing rules and
+        resolved inside the media directory, so it cannot escape via .. or an absolute path."""
+        from aiohttp import web
+        name = request.match_info.get('name', '')
+        if os.path.basename(name) != name:
+            return web.Response(status=400, text="bad name")
+        ext = os.path.splitext(name)[1].lower()
+        if ext not in self.MEDIA_EXT:
+            return web.Response(status=404, text="not found")
+        d = self._media_dir()
+        fp = os.path.abspath(os.path.join(d, name))
+        if os.path.dirname(fp) != d or not os.path.isfile(fp):
+            return web.Response(status=404, text="not found")
+        return web.FileResponse(fp, headers={"Content-Type": self.MEDIA_EXT[ext]})
+
     async def start_local_video_server(self):
         from aiohttp import web
         print("🎥 STARTING LOCAL VIDEO SERVER (0.0.0.0:8080)...")
         app = web.Application()
         app.router.add_get('/snapshot', self.handle_snapshot)
         app.router.add_get('/stream', self.handle_stream)
+        # Media recorded ON THE AIRCRAFT was previously unreachable: the app asked the cloud
+        # relay for /media while the files sat on this device, retrievable only over SSH.
+        app.router.add_get('/media', self.handle_media_list)
+        app.router.add_get('/media/{name}', self.handle_media_file)
         runner = web.AppRunner(app)
         await runner.setup()
         for attempt in range(5):
@@ -762,9 +824,6 @@ class RadxaBridge:
                     }
                     await ws.send(json.dumps(auth_frame))
 
-                    # START LOCAL GOPRO BLUETOOTH PROXY (once)
-                    if not self.gopro_proxy:
-                        asyncio.create_task(self.init_gopro_proxy())
 
                     # Command loop runs inside cloud connection (needs self.ws)
                     # Telemetry loop runs SEPARATELY in main gather (doesn't need cloud)
@@ -1154,6 +1213,38 @@ class RadxaBridge:
                         pass
             return True
 
+        if cmd in ('CALIBRATE_BATTERY', 'SET_BATT_CALIB'):
+            # The pack reads ~27 V on a 3S (should be ~11-12 V), and that same voltage feeds the
+            # auto-return threshold. Supply the voltage measured at the pack and the correct
+            # multiplier is computed from what the FC currently reports:
+            #     new_mult = old_mult * (measured / reported)
+            try:
+                measured = float(payload.get('measured_v', payload.get('voltage', 0)))
+            except Exception:
+                measured = 0.0
+            reported = float(self.telemetry_cache.get('voltage') or 0)
+            old_mult = float((self.telemetry_cache.get('fc_caps') or {}).get('BATT_VOLT_MULT') or 0)
+            if measured <= 0:
+                print("⚠️ CALIBRATE_BATTERY: supply measured_v (voltage at the pack)")
+            elif reported <= 0:
+                print("⚠️ CALIBRATE_BATTERY: FC is not reporting a voltage yet")
+            elif old_mult <= 0:
+                print("⚠️ CALIBRATE_BATTERY: BATT_VOLT_MULT unknown - requesting it, retry shortly")
+                if self.fc:
+                    self.fc.mav.param_request_read_send(self.fc.target_system,
+                                                        self.fc.target_component, b'BATT_VOLT_MULT', -1)
+            else:
+                new_mult = old_mult * (measured / reported)
+                print(f"🔋 BATT CALIB: reported={reported:.2f}V measured={measured:.2f}V "
+                      f"mult {old_mult:.4f} -> {new_mult:.4f}")
+                if self.fc:
+                    self.fc.mav.param_set_send(self.fc.target_system, self.fc.target_component,
+                                               b'BATT_VOLT_MULT', new_mult,
+                                               mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
+                    self.fc.mav.param_request_read_send(self.fc.target_system,
+                                                        self.fc.target_component, b'BATT_VOLT_MULT', -1)
+            return True
+
         if cmd == 'SET_BATT_THRESHOLD':
             try:
                 t = int(float(payload.get('threshold', 20)))
@@ -1206,7 +1297,17 @@ class RadxaBridge:
 
         if cmd == 'GOPRO_SETTINGS':
             self.gopro_settings = {**getattr(self, 'gopro_settings', {}), **payload}
-            print(f"🎥 GOPRO SETTINGS: {self.gopro_settings}")
+            print(f"🎥 GOPRO SETTINGS: {payload}")
+            # Actually execute it. gopro_proxy.handle_remote_ai_command already accepts this
+            # exact {'action': ..., 'value': ...} shape -- it simply was never called, so every
+            # GoPro button in the app was inert.
+            if self.gopro_proxy:
+                try:
+                    await self.gopro_proxy.handle_remote_ai_command(payload)
+                except Exception as e:
+                    print(f"❌ GoPro command failed: {e}")
+            else:
+                print("⚠️ GoPro proxy not connected - command dropped")
             return True
 
         if cmd in ('CAPTURE', 'CAPTURE_PHOTO'):
@@ -2917,7 +3018,10 @@ if __name__ == "__main__":
                 bridge.esp32_hardware_loop(),
                 bridge.watchdog_loop(),
                 bridge.start_local_server(),
-                bridge.start_local_video_server()
+                bridge.start_local_video_server(),
+                # GoPro init used to live inside connect_cloud, so making the cloud relay
+                # opt-in silently disabled the camera entirely. It belongs on the local path.
+                bridge.init_gopro_proxy()
             )
         asyncio.run(main())
     except KeyboardInterrupt:
