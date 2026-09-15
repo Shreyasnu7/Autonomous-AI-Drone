@@ -116,5 +116,17 @@ col2[top:top + int((bot - top) * 0.6), 100] = 0.8
 c2 = float(np.percentile(col2[top:bot, 100], 10))
 check("genuine obstacle still detected", c2 < 1.0, f"{c2:.2f}m")
 
+# 7. physical object size from box + depth + focal length. A doorway the aircraft cannot fit
+# through and one it can are the same class at the same distance -- only the size separates them.
+_f_full = (1280 / 2.0) / math.tan(math.radians(86.0) / 2.0)
+for _name, _tw, _th, _d in (("doorway", 0.90, 2.00, 3.0), ("person", 0.50, 1.70, 5.0)):
+    _bw = (_tw / _d) * _f_full
+    _bh = (_th / _d) * _f_full
+    _w = (_bw / _f_full) * _d
+    _h = (_bh / _f_full) * _d
+    check(f"{_name} physical size recovered",
+          abs(_w - _tw) < 0.02 and abs(_h - _th) < 0.02,
+          f"{_w:.2f}x{_h:.2f}m (true {_tw:.2f}x{_th:.2f})")
+
 print(f"\nDEPTH PROJECTION RESULT: {_passed} passed / {_failed} failed")
 sys.exit(1 if _failed else 0)
