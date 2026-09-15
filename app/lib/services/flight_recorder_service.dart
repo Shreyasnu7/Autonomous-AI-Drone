@@ -3,10 +3,10 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:path_provider/path_provider.dart';
 
-class FlightRecorderService {
-  static final FlightRecorderService _instance = FlightRecorderService._internal();
-  factory FlightRecorderService() => _instance;
-  FlightRecorderService._internal();
+class LocalFlightLogger {
+  static final LocalFlightLogger _instance = LocalFlightLogger._internal();
+  factory LocalFlightLogger() => _instance;
+  LocalFlightLogger._internal();
 
   File? _currentLogFile;
   bool _isRecording = false;

@@ -4,9 +4,12 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'auth_service.dart';
 import 'telemetry_service.dart';
 import 'api_service.dart';
+import 'flight_recorder_service.dart';
 
 class CentralState extends ChangeNotifier {
   final TelemetryService telemetry = TelemetryService();
+  final LocalFlightLogger flightLog = LocalFlightLogger();
+  bool _wasArmed = false;
   
   bool isLoggedIn = false;
   Map<String, dynamic>? userProfile;
@@ -149,6 +152,24 @@ class CentralState extends ChangeNotifier {
     telemetry.telemetryStream.listen((data) {
        telemetryData = data;
        
+       // Flight logging. Nothing in the app ever started a recording, so the hangar
+       // screen had no flight data to show. Start on arm, stop on disarm, write each
+       // frame locally (no cloud round-trip on the flight link).
+       final armedNow = data["armed"] == true || data["armed"] == 1;
+       if (armedNow && !_wasArmed) {
+         flightLog.startFlight();
+       } else if (!armedNow && _wasArmed) {
+         flightLog.stopFlight();
+       }
+       _wasArmed = armedNow;
+       if (armedNow) {
+         flightLog.logFrame(
+           data,
+           (data["lat"] is num) ? (data["lat"] as num).toDouble() : 0.0,
+           (data["lng"] is num) ? (data["lng"] as num).toDouble() : 0.0,
+         );
+       }
+
        // Update History Buffers
        if (data.containsKey("altitude")) _addToHistory(_altHistory, (data["altitude"] as num).toDouble());
        if (data.containsKey("speed")) _addToHistory(_speedHistory, (data["speed"] as num).toDouble());

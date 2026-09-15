@@ -68,6 +68,23 @@ class TelemetryService {
               _alertController.add(data['payload']);
             } else if (data['type'] == 'ai_response' || data['type'] == 'ai_status') {
               _aiResponseController.add(Map<String, dynamic>.from(data['payload'] ?? {}));
+            } else if (data['type'] == 'fc_status_text') {
+              // Flight-controller status text (PreArm failures, arming errors, AutoTune
+              // results). Previously dropped, so the operator could not see WHY an arm was
+              // refused without reading the bridge log over SSH.
+              final p = data['payload'];
+              final msg = (p is Map ? (p['text'] ?? p['msg'] ?? '') : p).toString();
+              if (msg.isNotEmpty) {
+                final sev = (p is Map ? (p['severity'] ?? 6) : 6);
+                final isErr = sev is int && sev <= 3;
+                _alertController.add({"msg": "FC: $msg", "level": isErr ? "error" : "info"});
+              }
+            } else if (data['type'] == 'safety_block') {
+              // The bridge refused a command for safety. Surfacing it is the point:
+              // silently ignoring an ARM makes the aircraft look broken.
+              final p = data['payload'];
+              final blocked = (p is Map ? (p['blocked_action'] ?? 'command') : 'command').toString();
+              _alertController.add({"msg": "BLOCKED: $blocked (safety)", "level": "error"});
             }
           } catch (e) {
             print("Telemetery Parse Error: $e");
