@@ -1126,10 +1126,18 @@ class DirectorCore:
                         except Exception:
                             pass
                     cx = max(0, min(w_d - 1, cx)); cy = max(0, min(h_d - 1, cy))
+                    # MOTION-TRIANGULATION SCALE — actually apply it.
+                    # The anchor computes a robust scale correction for the whole dense map from
+                    # the drone's own motion parallax, but it was only ever multiplied into the
+                    # per-object distance LABELS on the relative path. The metric map that feeds
+                    # the obstacle grid, the subject depth and the per-column clearances all went
+                    # through uncorrected, so with the metric model loaded (the default) the
+                    # parallax anchor corrected nothing that actually flies the aircraft.
+                    _dscale = self._fused_depth_scale()
                     if use_metric:
-                        self._subject_depth_m = min(float(metric_map[cy, cx]), 30.0)   # real metres
+                        self._subject_depth_m = min(float(metric_map[cy, cx]) * _dscale, 30.0)
                     else:
-                        self._subject_depth_m = min(rel2m(depth_map[cy, cx]), 30.0)
+                        self._subject_depth_m = min(rel2m(depth_map[cy, cx]) * _dscale, 30.0)
 
                     # --- FUSE CAMERA DEPTH INTO THE GRID across the FOV ---
                     # Each column -> a bearing; col_m[ix] = CLOSEST surface in that column, in METRES.
@@ -1138,6 +1146,7 @@ class DirectorCore:
                     # the old band/logic exactly. NOTE the body-frame projection still assumes the MOUNT
                     # geometry (cam pitch/fwd) — field-calibrate that on the real drone.
                     hfov = math.radians(MOUNT['cam_hfov_deg'])
+                    _tan_half_h = math.tan(hfov / 2.0)
                     if use_metric:
                         band = metric_map[int(h_d * 0.30):int(h_d * 0.62), :]
                         col_m = band.min(axis=0)                            # closest surface per column (metres)
@@ -1145,6 +1154,10 @@ class DirectorCore:
                         band = depth_map[int(h_d * 0.40):int(h_d * 0.75), :]  # mid/lower rows = ground & near obstacles
                         col_rel = band.min(axis=0)
                         col_m = np.array([rel2m(v) for v in col_rel], dtype=np.float32)
+                    # Same parallax correction on the clearances that drive avoidance, so the
+                    # grid, the subject distance and the object labels all share one scale.
+                    if _dscale != 1.0:
+                        col_m = col_m * _dscale
                     N = 48
                     step = max(1, w_d // N)
                     closest_front = 99.0
@@ -1161,7 +1174,13 @@ class DirectorCore:
                         m = float(col_m[ix])
                         if m >= FAR_M - 0.05:
                             continue
-                        bearing = (ix / w_d - 0.5) * hfov + _gp    # +right, incl. gimbal pan
+                        # PINHOLE bearing, not a linear pixel-to-angle map. The linear form
+                        # is exact only at the centre and the extreme edges; in between it is
+                        # wrong by up to 3.5 deg at this 86 deg FOV, which places an obstacle
+                        # 3 m away about 18 cm to the side of where it actually is. The correct
+                        # mapping is atan(x_normalised * tan(hfov/2)) for a rectilinear lens.
+                        _xn = (ix / w_d - 0.5) * 2.0          # -1 .. +1 across the sensor
+                        bearing = math.atan(_xn * _tan_half_h) + _gp   # +right, incl. gimbal pan
                         fwd = m * math.cos(bearing) + MOUNT['cam_forward']
                         lat = m * math.sin(bearing)
                         # body frame, forward = -y (matches ToF/grid convention)
@@ -1179,8 +1198,26 @@ class DirectorCore:
                             _tel2 = self.autopilot.get_telemetry() or {}
                             _pt = getattr(self, '_anch_prev_t', None)
                             _dtA = min(0.5, _t2 - _pt) if _pt else 0.0
+                            # BASELINE = how far the drone ACTUALLY moved between the two frames.
+                            # This used the COMMANDED velocity, but the aircraft does not
+                            # necessarily fly what was commanded -- wind, the clearance clamp and
+                            # the jerk limiter all alter it. Since triangulated depth scales
+                            # directly with the baseline, a commanded-vs-actual discrepancy
+                            # becomes a proportional depth error. Prefer the EKF's measured
+                            # velocity, rotated into the body frame, and fall back to the
+                            # commanded value only when no measurement is available.
+                            _vn = _tel2.get('vel_n'); _ve = _tel2.get('vel_e')
                             _lv = getattr(self.autopilot, '_last_vel', None) or (0, 0, 0, 0)
-                            _tb = (_lv[0]*_dtA, _lv[1]*_dtA, -_lv[2]*_dtA)   # fwd,right,up (cmd NED vz->up)
+                            if _vn is not None and _ve is not None:
+                                _hr2 = math.radians(float(_tel2.get('heading', 0) or 0))
+                                _bf = float(_vn) * math.cos(_hr2) + float(_ve) * math.sin(_hr2)
+                                _br = -float(_vn) * math.sin(_hr2) + float(_ve) * math.cos(_hr2)
+                                _bu = -float(_tel2.get('vel_d', 0) or 0)      # NED down -> up
+                                if abs(_bu) < 1e-9:
+                                    _bu = -_lv[2]                              # no vz measurement
+                                _tb = (_bf * _dtA, _br * _dtA, _bu * _dtA)
+                            else:
+                                _tb = (_lv[0]*_dtA, _lv[1]*_dtA, -_lv[2]*_dtA)  # commanded fallback
                             _pa = getattr(self, '_anch_prev_att', None) or {}
                             _da = ((_tel2.get('roll') or 0) - (_pa.get('roll') or 0),
                                    (_tel2.get('pitch') or 0) - (_pa.get('pitch') or 0),

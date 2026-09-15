@@ -1137,6 +1137,9 @@ class RadxaBridge:
                          # instead of starting from where the aircraft was actually heading.
                          self.telemetry_cache['vel_n'] = vx      # NED north component (m/s)
                          self.telemetry_cache['vel_e'] = vy      # NED east component (m/s)
+                         # Vertical too: the depth anchor's parallax baseline needs all three
+                         # axes to measure how far the camera actually travelled between frames.
+                         self.telemetry_cache['vel_d'] = msg.vz / 100.0   # NED down component (m/s)
                          # Heading from GPS (cdeg to deg)
                          self.telemetry_cache['heading'] = msg.hdg / 100.0 if msg.hdg != 65535 else self.telemetry_cache.get('heading', 0)
 
