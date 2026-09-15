@@ -560,9 +560,26 @@ class LocalERBrain:
                 "detections": detections
             }]
 
+    # A decision older than this is not a decision, it is a memory. The director applies the
+    # returned flight vector on EVERY frame, so if inference stalls or the vLLM server dies,
+    # serving the last one keeps the aircraft flying that heading indefinitely -- a stale
+    # COMMAND, which is worse than stale sensing.
+    DECISION_MAX_AGE_S = float(os.getenv("PILOT_DECISION_MAX_AGE_S", "2.0"))
+
     def get_latest_decision(self):
+        """The pilot's most recent decision, or None once it has gone stale."""
         with self._lock:
-            return self._latest_decision
+            d = self._latest_decision
+            if d is None:
+                return None
+            if time.time() - getattr(self, '_decision_t', 0.0) > self.DECISION_MAX_AGE_S:
+                if not getattr(self, '_decision_stale_warned', False):
+                    self._decision_stale_warned = True
+                    logger.warning("pilot decision stale (inference stalled or server down) "
+                                   "- withholding it; the aircraft holds instead of flying a memory")
+                return None
+            self._decision_stale_warned = False
+            return d
 
     def note_blocked(self, reason):
         """The director's safety layer clamped/blocked the pilot's last command — tell the pilot in its
@@ -922,6 +939,7 @@ class LocalERBrain:
                                 self._temperature = self._base_temperature
                                 self._repetition_penalty = float(os.getenv("PILOT_REP_PEN", "1.15"))
                         self._latest_decision = decision
+                        self._decision_t = time.time()
                         self._decision_history.append(decision)
                         if len(self._decision_history) > self._max_history:
                             self._decision_history.pop(0)
