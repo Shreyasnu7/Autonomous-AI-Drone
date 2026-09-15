@@ -1,4 +1,17 @@
 #!/bin/bash
+
+# ---- Network credentials -------------------------------------------------
+# Supplied by the operator, never committed. Either export these before
+# running, or place them in /etc/drone-wifi.conf (chmod 600):
+#     WIFI_SSID="my-hotspot"          WIFI_PASS="..."
+#     WIFI_FALLBACK_SSID="my-router"  WIFI_FALLBACK_PASS="..."
+[ -f /etc/drone-wifi.conf ] && . /etc/drone-wifi.conf
+WIFI_SSID="${WIFI_SSID:-}"
+WIFI_PASS="${WIFI_PASS:-}"
+WIFI_FALLBACK_SSID="${WIFI_FALLBACK_SSID:-}"
+WIFI_FALLBACK_PASS="${WIFI_FALLBACK_PASS:-}"
+# --------------------------------------------------------------------------
+
 # =====================================================
 # RADXA CUBIE A7Z - POST-FLASH SETUP v5.0
 # For: Radxa Debian 11 CLI on SD card
@@ -57,8 +70,8 @@ else
 fi
 
 # Connect to phone hotspot WiFi
-nmcli dev wifi connect "S21 ultra" password "22219413" 2>/dev/null || echo "  WiFi connect failed (may already be connected)"
-echo "  WiFi: S21 ultra connected"
+nmcli dev wifi connect "$WIFI_SSID" password "$WIFI_PASS" 2>/dev/null || echo "  WiFi connect failed (may already be connected)"
+echo "  WiFi: $WIFI_SSID connected"
 
 # Force enable SSH NOW (so we never get locked out)
 apt-get install -y openssh-server 2>/dev/null || true

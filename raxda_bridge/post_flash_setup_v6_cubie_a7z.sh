@@ -1,4 +1,17 @@
 #!/bin/bash
+
+# ---- Network credentials -------------------------------------------------
+# Supplied by the operator, never committed. Either export these before
+# running, or place them in /etc/drone-wifi.conf (chmod 600):
+#     WIFI_SSID="my-hotspot"          WIFI_PASS="..."
+#     WIFI_FALLBACK_SSID="my-router"  WIFI_FALLBACK_PASS="..."
+[ -f /etc/drone-wifi.conf ] && . /etc/drone-wifi.conf
+WIFI_SSID="${WIFI_SSID:-}"
+WIFI_PASS="${WIFI_PASS:-}"
+WIFI_FALLBACK_SSID="${WIFI_FALLBACK_SSID:-}"
+WIFI_FALLBACK_PASS="${WIFI_FALLBACK_PASS:-}"
+# --------------------------------------------------------------------------
+
 # =====================================================
 # RADXA CUBIE A7Z - POST-FLASH SETUP v6.0
 # COMPLETE RESTORE — reflash + run this = back to 100%
@@ -9,7 +22,7 @@
 #   1. Flash Radxa Debian 11 CLI to SD card
 #   2. Boot with monitor+keyboard OR UART
 #   3. Login as root (or default user)
-#   4. Connect WiFi: nmcli dev wifi connect "S21 ultra" password "22219413"
+#   4. Connect WiFi: nmcli dev wifi connect "$WIFI_SSID" password "$WIFI_PASS"
 #   5. Create user: adduser shreyash (password: 1)
 #   6. SCP this script + raxda_bridge folder:
 #      scp post_flash_setup_v6_cubie_a7z.sh shreyash@<ip>:~/
@@ -97,7 +110,7 @@ echo "[5] WiFi auto-reconnect service..."
 cat > /usr/local/bin/wifi-reconnect.sh << 'WIFI_EOF'
 #!/bin/bash
 # WiFi auto-reconnect — ensures Cubie always has a network connection
-# Priority: S21 ultra (hotspot) > 4G-UFI-224D > any saved connection
+# Priority: $WIFI_SSID (hotspot) > $WIFI_FALLBACK_SSID > any saved connection
 # NEVER auto-connect to GoPro WiFi (GP*) — that kills internet
 
 while true; do
@@ -117,15 +130,15 @@ while true; do
     fi
 
     # Try phone hotspot first
-    if nmcli dev wifi list 2>/dev/null | grep -q "S21 ultra"; then
-        echo "$(date): Connecting to S21 ultra..."
-        nmcli dev wifi connect "S21 ultra" password "22219413" 2>/dev/null && continue
+    if nmcli dev wifi list 2>/dev/null | grep -q "$WIFI_SSID"; then
+        echo "$(date): Connecting to $WIFI_SSID..."
+        nmcli dev wifi connect "$WIFI_SSID" password "$WIFI_PASS" 2>/dev/null && continue
     fi
 
     # Try 4G dongle WiFi
-    if nmcli dev wifi list 2>/dev/null | grep -q "4G-UFI-224D"; then
-        echo "$(date): Connecting to 4G-UFI-224D..."
-        nmcli dev wifi connect "4G-UFI-224D" password "1234567890" 2>/dev/null && continue
+    if nmcli dev wifi list 2>/dev/null | grep -q "$WIFI_FALLBACK_SSID"; then
+        echo "$(date): Connecting to $WIFI_FALLBACK_SSID..."
+        nmcli dev wifi connect "$WIFI_FALLBACK_SSID" password "$WIFI_FALLBACK_PASS" 2>/dev/null && continue
     fi
 
     # Try any saved connection
@@ -157,17 +170,17 @@ echo "  ✅ Auto-reconnect active (blocks GoPro WiFi)"
 # ===== 6. WiFi CONNECTIONS (pre-save known networks) =====
 echo "[6] Saving known WiFi networks..."
 # Phone hotspot (priority 20 — preferred)
-nmcli connection add type wifi con-name "S21 ultra" ssid "S21 ultra" \
-    wifi-sec.key-mgmt wpa-psk wifi-sec.psk "22219413" \
+nmcli connection add type wifi con-name "$WIFI_SSID" ssid "$WIFI_SSID" \
+    wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$WIFI_PASS" \
     connection.autoconnect yes connection.autoconnect-priority 20 \
-    2>/dev/null || nmcli connection modify "S21 ultra" connection.autoconnect yes connection.autoconnect-priority 20 2>/dev/null || true
+    2>/dev/null || nmcli connection modify "$WIFI_SSID" connection.autoconnect yes connection.autoconnect-priority 20 2>/dev/null || true
 
 # 4G dongle WiFi (priority 10 — fallback)
-nmcli connection add type wifi con-name "4G-UFI-224D" ssid "4G-UFI-224D" \
-    wifi-sec.key-mgmt wpa-psk wifi-sec.psk "1234567890" \
+nmcli connection add type wifi con-name "$WIFI_FALLBACK_SSID" ssid "$WIFI_FALLBACK_SSID" \
+    wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$WIFI_FALLBACK_PASS" \
     connection.autoconnect yes connection.autoconnect-priority 10 \
-    2>/dev/null || nmcli connection modify "4G-UFI-224D" connection.autoconnect yes connection.autoconnect-priority 10 2>/dev/null || true
-echo "  ✅ S21 ultra (priority 20) + 4G-UFI-224D (priority 10)"
+    2>/dev/null || nmcli connection modify "$WIFI_FALLBACK_SSID" connection.autoconnect yes connection.autoconnect-priority 10 2>/dev/null || true
+echo "  ✅ $WIFI_SSID (priority 20) + $WIFI_FALLBACK_SSID (priority 10)"
 
 # ===== 7. 4G DONGLE RNDIS USB DRIVER =====
 echo "[7] 4G dongle RNDIS driver..."
@@ -379,7 +392,7 @@ echo " POST-FLASH SETUP v6.0 COMPLETE!"
 echo "================================================"
 echo ""
 echo " ✅ SSH:           ON (shreyash / pw: 1)"
-echo " ✅ WiFi:          S21 ultra (auto-reconnect)"
+echo " ✅ WiFi:          $WIFI_SSID (auto-reconnect)"
 echo " ✅ 4G Dongle:     RNDIS driver loaded"
 echo " ✅ Tailscale:     Installed (run: sudo tailscale up)"
 echo " ✅ Thermal:       65°C throttle, never shutdown"
