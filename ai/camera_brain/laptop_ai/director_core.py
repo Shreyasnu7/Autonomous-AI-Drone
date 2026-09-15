@@ -357,13 +357,25 @@ MOUNT = {
     'cam_z':       -0.06,    # camera 6 cm below centre
     'cam_forward':  0.04,    # camera 4 cm forward of centre
     'cam_pitch_deg': 10.0,   # camera tilted 10° down from horizontal
-    'cam_hfov_deg':  86.0,   # GoPro HERO12 linear HFOV (~86° at the res used)
+    # HORIZONTAL FIELD OF VIEW — the single most load-bearing constant in the camera path.
+    # Every bearing, every object size and the triangulated depth scale are computed from
+    # f = (width/2)/tan(hfov/2), so if this does not match the camera's ACTUAL mode the whole
+    # geometry is wrong by a constant factor: assuming 86 deg while the GoPro is in Wide (120)
+    # overstates sizes and depths by 86%, and at an 0.5x ultrawide setting by nearly 3x.
+    # GoPro HERO12 webcam modes: Narrow ~73, Linear ~86, Wide ~120. Digital zoom changes it
+    # again. Override with CAM_HFOV_DEG once measured -- see tools/measure_hfov.py.
+    'cam_hfov_deg':  float(os.getenv('CAM_HFOV_DEG', '86.0')),
 }
 
 
 class DirectorCore:
     def __init__(self, simulation_only=False):
         print(f"Initializing Director Core (Sim={simulation_only})...")
+        # The camera geometry constant every distance and size derives from. Printed so a
+        # mismatch with the camera's actual mode is visible before flight rather than
+        # discovered as a systematic error in the numbers the AI reports.
+        print(f"📐 Camera HFOV in use: {MOUNT['cam_hfov_deg']:.1f} deg "
+              f"({'default - VERIFY with tools/measure_hfov.py' if not os.getenv('CAM_HFOV_DEG') else 'from CAM_HFOV_DEG'})")
         self.simulation_only = simulation_only
         self.simulate = simulation_only
         self.ws = MessagingClient("laptop_vision")
